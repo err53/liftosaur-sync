@@ -8,6 +8,7 @@ from liftosaur_intervals_sync import (
     parse_liftosaur_workout,
     plan_sync,
     replace_managed_block,
+    render_managed_block,
 )
 
 
@@ -43,6 +44,40 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(plan.actions[0].intervals_id, "i1")
         self.assertEqual(plan.actions[0].match_kind, "time")
         self.assertFalse(any(action.kind == "fallback" for action in plan.actions))
+
+    def test_existing_managed_block_matches_by_liftosaur_id_before_time(self):
+        workout = LiftosaurWorkout(
+            id="123",
+            start=instant("2026-05-26T21:07:57Z"),
+            duration_seconds=3894,
+            text="raw",
+            summary="summary",
+            kg_lifted=100.0,
+        )
+        activity_with_comment = IntervalsActivity(
+            id="previous",
+            type="WeightTraining",
+            start=instant("2026-05-20T21:10:45Z"),
+            duration_seconds=3884,
+            has_heartrate=True,
+            description="LIFTOSAUR-SYNC-START id=123\nold\nLIFTOSAUR-SYNC-END id=123",
+            tags=None,
+        )
+        time_match = IntervalsActivity(
+            id="time",
+            type="WeightTraining",
+            start=instant("2026-05-26T21:10:45Z"),
+            duration_seconds=3884,
+            has_heartrate=True,
+            description=None,
+            tags=None,
+        )
+
+        plan = plan_sync([workout], [activity_with_comment, time_match], PlanningOptions())
+
+        self.assertEqual(plan.actions[0].kind, "enrich")
+        self.assertEqual(plan.actions[0].intervals_id, "previous")
+        self.assertEqual(plan.actions[0].match_kind, "description")
 
     def test_ineligible_overlap_warns_and_falls_back(self):
         workout = LiftosaurWorkout(
@@ -136,11 +171,20 @@ class ParserAndRenderingTests(unittest.TestCase):
         self.assertAlmostEqual(workout.kg_lifted or 0, expected_kg, places=3)
 
     def test_replaces_only_managed_block(self):
-        original = "User text\n<!-- liftosaur-sync:start id=123 -->\nOld\n<!-- liftosaur-sync:end id=123 -->\nFooter"
+        original = "User text\nLIFTOSAUR-SYNC-START id=123\nOld\nLIFTOSAUR-SYNC-END id=123\nFooter"
 
         updated = replace_managed_block(original, "123", "New")
 
-        self.assertEqual(updated, "User text\n<!-- liftosaur-sync:start id=123 -->\nNew\n<!-- liftosaur-sync:end id=123 -->\nFooter")
+        self.assertEqual(updated, "User text\nLIFTOSAUR-SYNC-START id=123\nNew\nLIFTOSAUR-SYNC-END id=123\nFooter")
+
+    def test_rendered_managed_block_is_plain_text(self):
+        workout = LiftosaurWorkout("123", instant("2026-05-26T21:07:57Z"), 3894, "raw text", "Squat\nWork: 3x5 @ 100 lb", 100.0)
+
+        block = render_managed_block(workout)
+
+        self.assertIn("Raw Liftosaur data:", block)
+        self.assertNotIn("<details>", block)
+        self.assertNotIn("```", block)
 
 
 if __name__ == "__main__":

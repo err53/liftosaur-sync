@@ -44,7 +44,7 @@ class MutationPayloadTests(unittest.TestCase):
 
         self.assertEqual(set(update), {"description", "kg_lifted", "tags"})
         self.assertIn("Existing notes", update["description"])
-        self.assertIn("<!-- liftosaur-sync:start id=123 -->", update["description"])
+        self.assertIn("LIFTOSAUR-SYNC-START id=123", update["description"])
         self.assertIn("Squat", update["description"])
         self.assertEqual(update["kg_lifted"], 680.388555)
         self.assertEqual(update["tags"], ["keep", "liftosaur"])
@@ -105,7 +105,7 @@ class MutationPayloadTests(unittest.TestCase):
             start=instant("2026-05-26T21:10:45Z"),
             duration_seconds=3884,
             has_heartrate=True,
-            description="Before\n<!-- liftosaur-sync:start id=123 -->\nOld\n<!-- liftosaur-sync:end id=123 -->\nAfter",
+            description="Before\nLIFTOSAUR-SYNC-START id=123\nOld\nLIFTOSAUR-SYNC-END id=123\nAfter",
             tags=None,
         )
 
@@ -142,7 +142,7 @@ class MutationPayloadTests(unittest.TestCase):
         self.assertEqual(update["elapsed_time"], 3894)
         self.assertEqual(update["moving_time"], 3894)
         self.assertEqual(update["kg_lifted"], 680.388555)
-        self.assertIn("<!-- liftosaur-sync:start id=123 -->", update["description"])
+        self.assertIn("LIFTOSAUR-SYNC-START id=123", update["description"])
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ uv run python main.py --days 14 --json
 uv run python main.py --days 14 --apply
 ```
 
-`--apply` enriches Time Matched Intervals Activities with a managed Liftosaur description block, `kg_lifted` when computed, and the `liftosaur` tag. It creates or updates Manual Fallback Activities only when no eligible Time Match exists.
+`--apply` enriches Time Matched Intervals Activities with a plain-text managed Liftosaur description block, `kg_lifted` when computed, and the `liftosaur` tag. On later runs, the managed block's Liftosaur history ID is used before Time Match so the same Intervals Activity is updated again. It creates or updates Manual Fallback Activities only when no eligible Time Match exists.
 
 ## Tests
 

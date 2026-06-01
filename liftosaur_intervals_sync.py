@@ -12,7 +12,6 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from html import escape
 from zoneinfo import ZoneInfo
 
 from tabulate import tabulate
@@ -20,6 +19,8 @@ from tabulate import tabulate
 
 ELIGIBLE_INTERVALS_TYPES = {"WeightTraining", "Workout"}
 LB_TO_KG = 0.45359237
+MANAGED_START_TEMPLATE = "LIFTOSAUR-SYNC-START id={id}"
+MANAGED_END_TEMPLATE = "LIFTOSAUR-SYNC-END id={id}"
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,24 @@ def plan_sync(
         warnings.append(f"Liftosaur Workout {workout_id} overlaps another Liftosaur Workout; skipping")
         actions_by_workout[workout_id] = SyncAction("skip", workout_id, reason="overlapping Liftosaur Workouts")
 
+    for workout in workouts:
+        if workout.id in actions_by_workout:
+            continue
+        description_matches = [activity for activity in activities if has_managed_block(activity.description, workout.id)]
+        if len(description_matches) == 1:
+            activity = description_matches[0]
+            action_warnings: list[str] = []
+            if not activity.has_heartrate:
+                warning = f"Matched Intervals Activity {activity.id} has no heart-rate data"
+                warnings.append(warning)
+                action_warnings.append(warning)
+            actions_by_workout[workout.id] = SyncAction(
+                "enrich", workout.id, intervals_id=activity.id, match_kind="description", warnings=tuple(action_warnings)
+            )
+        elif len(description_matches) > 1:
+            warnings.append(f"Liftosaur Workout {workout.id} has managed blocks on multiple Intervals Activities; skipping")
+            actions_by_workout[workout.id] = SyncAction("skip", workout.id, reason="multiple managed blocks")
+
     candidates_by_workout: dict[str, list[MatchCandidate]] = {}
     matched_workouts_by_activity: dict[str, list[str]] = {}
 
@@ -199,39 +218,46 @@ def plan_sync(
 
 
 def replace_managed_block(description: str | None, liftosaur_id: str, body: str) -> str:
-    start_marker = f"<!-- liftosaur-sync:start id={liftosaur_id} -->"
-    end_marker = f"<!-- liftosaur-sync:end id={liftosaur_id} -->"
+    start_marker = MANAGED_START_TEMPLATE.format(id=liftosaur_id)
+    end_marker = MANAGED_END_TEMPLATE.format(id=liftosaur_id)
     block = f"{start_marker}\n{body}\n{end_marker}"
     existing = description or ""
-    pattern = re.compile(
-        re.escape(start_marker) + r".*?" + re.escape(end_marker),
-        flags=re.DOTALL,
-    )
-    if pattern.search(existing):
-        return pattern.sub(block, existing)
+    for pattern in _managed_block_patterns(liftosaur_id):
+        if pattern.search(existing):
+            return pattern.sub(block, existing)
     if existing.strip():
         return existing.rstrip() + "\n\n" + block
     return block
 
 
+def has_managed_block(description: str | None, liftosaur_id: str) -> bool:
+    existing = description or ""
+    return any(pattern.search(existing) for pattern in _managed_block_patterns(liftosaur_id))
+
+
+def _managed_block_patterns(liftosaur_id: str) -> list[re.Pattern[str]]:
+    plain_start = MANAGED_START_TEMPLATE.format(id=liftosaur_id)
+    plain_end = MANAGED_END_TEMPLATE.format(id=liftosaur_id)
+    html_start = f"<!-- liftosaur-sync:start id={liftosaur_id} -->"
+    html_end = f"<!-- liftosaur-sync:end id={liftosaur_id} -->"
+    return [
+        re.compile(re.escape(plain_start) + r".*?" + re.escape(plain_end), flags=re.DOTALL),
+        re.compile(re.escape(html_start) + r".*?" + re.escape(html_end), flags=re.DOTALL),
+    ]
+
+
 def render_managed_block(workout: LiftosaurWorkout) -> str:
     title = workout.day_name or workout.program or "Strength Training"
-    lines = [f"Liftosaur: {escape(title)}", f"Liftosaur history ID: {escape(workout.id)}"]
+    lines = [f"Liftosaur: {title}", f"Liftosaur history ID: {workout.id}"]
     if workout.duration_seconds is not None:
         lines.append(f"Duration: {workout.duration_seconds}s")
     if workout.kg_lifted is not None:
         lines.append(f"kg_lifted: {workout.kg_lifted:.3f}")
     lines.append("")
-    lines.append(escape(workout.summary))
+    lines.append(workout.summary)
     lines.append("")
-    lines.append("<details>")
-    lines.append("<summary>Raw Liftosaur data</summary>")
-    lines.append("")
-    lines.append("```text")
-    lines.append(escape(workout.text))
-    lines.append("```")
-    lines.append("")
-    lines.append("</details>")
+    lines.append("Raw Liftosaur data:")
+    lines.append(workout.text)
     return "\n".join(lines)
 
 
