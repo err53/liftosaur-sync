@@ -59,8 +59,8 @@ class MutationPayloadTests(unittest.TestCase):
         ]
         plan = SyncPlan(
             actions=[
-                SyncAction("enrich", "enrich", intervals_id="i-enrich"),
-                SyncAction("fallback", "fallback"),
+                SyncAction.enrich("enrich", "i-enrich", "time"),
+                SyncAction.fallback("fallback"),
             ],
             warnings=[],
         )
@@ -84,8 +84,8 @@ class MutationPayloadTests(unittest.TestCase):
         ]
         plan = SyncPlan(
             actions=[
-                SyncAction("enrich", "fail", intervals_id="i-fail"),
-                SyncAction("enrich", "ok", intervals_id="i-ok"),
+                SyncAction.enrich("fail", "i-fail", "time"),
+                SyncAction.enrich("ok", "i-ok", "time"),
             ],
             warnings=[],
         )
@@ -127,7 +127,7 @@ class MutationPayloadTests(unittest.TestCase):
             program="GZCLP",
             day_name="Day 1",
         )
-        action = SyncAction("fallback", "123", intervals_id="i-created")
+        action = SyncAction.fallback("123", intervals_id="i-created")
 
         upsert = build_fallback_upsert(workout, "America/Toronto")
         update = build_fallback_update(workout, action)

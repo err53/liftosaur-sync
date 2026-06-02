@@ -192,6 +192,36 @@ class StravaSyncAction:
     warnings: tuple[str, ...] = ()
     upload: StructuredStravaUpload | None = None
 
+    @classmethod
+    def upload_activity(cls, upload: StructuredStravaUpload) -> "StravaSyncAction":
+        return cls(
+            "upload",
+            upload.liftosaur_id,
+            intervals_id=upload.intervals_id,
+            mapped_set_count=upload.mapped_set_count,
+            warnings=upload.warnings,
+            upload=upload,
+        )
+
+    @classmethod
+    def skip(
+        cls,
+        liftosaur_id: str,
+        reason: str,
+        intervals_id: str | None = None,
+        strava_id: str | None = None,
+        warnings: tuple[str, ...] = (),
+    ) -> "StravaSyncAction":
+        return cls("skip", liftosaur_id, intervals_id=intervals_id, strava_id=strava_id, reason=reason, warnings=warnings)
+
+    @property
+    def is_upload(self) -> bool:
+        return self.kind == "upload"
+
+    @property
+    def is_skip(self) -> bool:
+        return self.kind == "skip"
+
 
 @dataclass(frozen=True)
 class StravaSyncPlan:
@@ -215,6 +245,36 @@ class SyncAction:
     reason: str | None = None
     match_kind: str | None = None
     warnings: tuple[str, ...] = ()
+
+    @classmethod
+    def enrich(
+        cls,
+        liftosaur_id: str,
+        intervals_id: str,
+        match_kind: str,
+        warnings: tuple[str, ...] = (),
+    ) -> "SyncAction":
+        return cls("enrich", liftosaur_id, intervals_id=intervals_id, match_kind=match_kind, warnings=warnings)
+
+    @classmethod
+    def fallback(cls, liftosaur_id: str, intervals_id: str | None = None) -> "SyncAction":
+        return cls("fallback", liftosaur_id, intervals_id=intervals_id)
+
+    @classmethod
+    def skip(cls, liftosaur_id: str, reason: str) -> "SyncAction":
+        return cls("skip", liftosaur_id, reason=reason)
+
+    @property
+    def is_enrich(self) -> bool:
+        return self.kind == "enrich"
+
+    @property
+    def is_fallback(self) -> bool:
+        return self.kind == "fallback"
+
+    @property
+    def is_skip(self) -> bool:
+        return self.kind == "skip"
 
 
 @dataclass(frozen=True)
@@ -305,7 +365,7 @@ def plan_sync(
     overlapping_workouts = time_matches.overlapping_workout_ids(workouts)
     for workout_id in sorted(overlapping_workouts):
         warnings.append(f"Liftosaur Workout {workout_id} overlaps another Liftosaur Workout; skipping")
-        actions_by_workout[workout_id] = SyncAction("skip", workout_id, reason="overlapping Liftosaur Workouts")
+        actions_by_workout[workout_id] = SyncAction.skip(workout_id, "overlapping Liftosaur Workouts")
 
     for workout in workouts:
         if workout.id in actions_by_workout:
@@ -318,12 +378,10 @@ def plan_sync(
                 warning = f"Matched Intervals Activity {activity.id} has no heart-rate data"
                 warnings.append(warning)
                 action_warnings.append(warning)
-            actions_by_workout[workout.id] = SyncAction(
-                "enrich", workout.id, intervals_id=activity.id, match_kind="description", warnings=tuple(action_warnings)
-            )
+            actions_by_workout[workout.id] = SyncAction.enrich(workout.id, activity.id, "description", tuple(action_warnings))
         elif len(description_matches) > 1:
             warnings.append(f"Liftosaur Workout {workout.id} has managed blocks on multiple Intervals Activities; skipping")
-            actions_by_workout[workout.id] = SyncAction("skip", workout.id, reason="multiple managed blocks")
+            actions_by_workout[workout.id] = SyncAction.skip(workout.id, "multiple managed blocks")
 
     match_index = time_matches.index_intervals_activities(
         [workout for workout in workouts if workout.id not in actions_by_workout], activities
@@ -334,9 +392,7 @@ def plan_sync(
         if workout.id in actions_by_workout:
             continue
         if workout.id in match_index.ambiguous_workout_ids:
-            actions_by_workout[workout.id] = SyncAction(
-                "skip", workout.id, reason="one Intervals Activity matches multiple Liftosaur Workouts"
-            )
+            actions_by_workout[workout.id] = SyncAction.skip(workout.id, "one Intervals Activity matches multiple Liftosaur Workouts")
             continue
 
         candidates = match_index.candidates_by_workout.get(workout.id, [])
@@ -346,23 +402,21 @@ def plan_sync(
             winner = time_matches.choose(candidates)
             if winner is None:
                 warnings.append(f"Liftosaur Workout {workout.id} has tied Time Matches; skipping")
-                actions_by_workout[workout.id] = SyncAction("skip", workout.id, reason="tied Time Matches")
+                actions_by_workout[workout.id] = SyncAction.skip(workout.id, "tied Time Matches")
                 continue
             action_warnings: list[str] = []
             if not winner.activity.has_heartrate:
                 warning = f"Matched Intervals Activity {winner.activity.id} has no heart-rate data"
                 warnings.append(warning)
                 action_warnings.append(warning)
-            actions_by_workout[workout.id] = SyncAction(
-                "enrich", workout.id, intervals_id=winner.activity.id, match_kind="time", warnings=tuple(action_warnings)
-            )
+            actions_by_workout[workout.id] = SyncAction.enrich(workout.id, winner.activity.id, "time", tuple(action_warnings))
             continue
 
         if workout.duration_seconds is None and options.default_duration_seconds is None:
             warnings.append(f"Liftosaur Workout {workout.id} has no duration; skipping Manual Fallback Activity")
-            actions_by_workout[workout.id] = SyncAction("skip", workout.id, reason="missing duration")
+            actions_by_workout[workout.id] = SyncAction.skip(workout.id, "missing duration")
         else:
-            actions_by_workout[workout.id] = SyncAction("fallback", workout.id)
+            actions_by_workout[workout.id] = SyncAction.fallback(workout.id)
 
     return SyncPlan(actions=[actions_by_workout[workout.id] for workout in workouts], warnings=warnings)
 
@@ -385,29 +439,23 @@ def plan_strava_sync(
         if external_matches:
             if len(external_matches) > 1:
                 warnings.append(f"Liftosaur Workout {workout.id} has multiple Strava external ID matches")
-            actions.append(
-                StravaSyncAction("skip", workout.id, strava_id=external_matches[0].id, reason="already uploaded")
-            )
+            actions.append(StravaSyncAction.skip(workout.id, "already uploaded", strava_id=external_matches[0].id))
             continue
 
         strava_time_matches = time_matches.strava_time_matches(workout, strava_activities)
         if strava_time_matches:
             if len(strava_time_matches) > 1:
                 warnings.append(f"Liftosaur Workout {workout.id} has multiple existing Strava Time Matches")
-            actions.append(
-                StravaSyncAction("skip", workout.id, strava_id=strava_time_matches[0].id, reason="existing Strava Time Match")
-            )
+            actions.append(StravaSyncAction.skip(workout.id, "existing Strava Time Match", strava_id=strava_time_matches[0].id))
             continue
 
         intervals_match = time_matches.choose_intervals_hr_source(workout, intervals_activities)
         if intervals_match is None:
-            actions.append(StravaSyncAction("skip", workout.id, reason="missing Intervals Time Match"))
+            actions.append(StravaSyncAction.skip(workout.id, "missing Intervals Time Match"))
             continue
         hr_stream = hr_streams_by_intervals_id.get(intervals_match.activity.id)
         if hr_stream is None or not hr_stream.time or not hr_stream.heartrate:
-            actions.append(
-                StravaSyncAction("skip", workout.id, intervals_id=intervals_match.activity.id, reason="missing HR stream")
-            )
+            actions.append(StravaSyncAction.skip(workout.id, "missing HR stream", intervals_id=intervals_match.activity.id))
             continue
 
         unmapped = _unmapped_work_exercise_names(workout)
@@ -415,11 +463,10 @@ def plan_strava_sync(
             warning = f"Liftosaur Workout {workout.id} has unmapped exercises: {', '.join(unmapped)}"
             warnings.append(warning)
             actions.append(
-                StravaSyncAction(
-                    "skip",
+                StravaSyncAction.skip(
                     workout.id,
+                    "unmapped exercises",
                     intervals_id=intervals_match.activity.id,
-                    reason="unmapped exercises",
                     warnings=(warning,),
                 )
             )
@@ -428,21 +475,12 @@ def plan_strava_sync(
         try:
             upload = upload_policy.build(workout, intervals_match.activity, hr_stream)
         except ValueError as error:
-            actions.append(
-                StravaSyncAction("skip", workout.id, intervals_id=intervals_match.activity.id, reason=str(error))
-            )
+            actions.append(StravaSyncAction.skip(workout.id, str(error), intervals_id=intervals_match.activity.id))
             continue
         action_warnings = list(upload.warnings)
         warnings.extend(action_warnings)
         actions.append(
-            StravaSyncAction(
-                "upload",
-                workout.id,
-                intervals_id=intervals_match.activity.id,
-                mapped_set_count=upload.mapped_set_count,
-                warnings=upload.warnings,
-                upload=upload,
-            )
+            StravaSyncAction.upload_activity(upload)
         )
     return StravaSyncPlan(actions, warnings)
 
@@ -1185,11 +1223,11 @@ class IntervalsWriteWorkflow:
         workouts_by_id: dict[str, LiftosaurWorkout],
         activities_by_id: dict[str, IntervalsActivity],
     ) -> WriteOutcome:
-        if action.kind == "enrich":
+        if action.is_enrich:
             return self._enrich(action, workouts_by_id, activities_by_id)
-        if action.kind == "fallback":
+        if action.is_fallback:
             return self._upsert_manual_fallback(action, workouts_by_id)
-        if action.kind == "skip":
+        if action.is_skip:
             return WriteOutcome(action.liftosaur_id, "skipped", reason=action.reason)
         raise ValueError(f"Unknown sync action kind: {action.kind}")
 
@@ -1213,7 +1251,7 @@ class IntervalsWriteWorkflow:
         workout = workouts_by_id[action.liftosaur_id]
         upsert = build_fallback_upsert(workout, self.intervals_adapter.timezone_name)
         intervals_id = self.intervals_adapter.upsert_manual_activity(upsert)
-        update = build_fallback_update(workout, SyncAction("fallback", workout.id, intervals_id=intervals_id))
+        update = build_fallback_update(workout, SyncAction.fallback(workout.id, intervals_id=intervals_id))
         self.intervals_adapter.update_activity(intervals_id, update)
         return WriteOutcome(workout.id, "fallback_upserted", intervals_id=intervals_id)
 
@@ -1239,12 +1277,12 @@ def apply_strava_sync_plan(
     outcomes: list[StravaWriteOutcome] = []
     for action in plan.actions:
         try:
-            if action.kind == "upload":
+            if action.is_upload:
                 if action.upload is None:
                     raise RuntimeError("missing Structured Strava Upload intent")
                 strava_id = strava_adapter.upload_structured_activity(action.upload.payload)
                 outcomes.append(StravaWriteOutcome(action.liftosaur_id, "uploaded", strava_id=strava_id))
-            elif action.kind == "skip":
+            elif action.is_skip:
                 outcomes.append(StravaWriteOutcome(action.liftosaur_id, "skipped", strava_id=action.strava_id, reason=action.reason))
         except Exception as error:
             outcomes.append(
@@ -1732,12 +1770,12 @@ def print_plan(
         kg_lifted = _format_kg_lifted(workout.kg_lifted) if workout else ""
         outcome = outcomes_by_liftosaur_id.get(action.liftosaur_id)
         outcome_text = outcome.status if outcome else ""
-        if action.kind == "enrich":
+        if action.is_enrich:
             activity = activities_by_id.get(action.intervals_id or "")
             hr = "hr=yes" if activity and activity.has_heartrate else "hr=no"
             activity_start = _format_display_time(activity.start) if activity else "unknown"
             rows.append(["enrich", action.liftosaur_id, workout_start, kg_lifted, action.intervals_id or "", activity_start, action.match_kind or "", hr, outcome_text, _outcome_note(outcome)])
-        elif action.kind == "fallback":
+        elif action.is_fallback:
             intervals_id = outcome.intervals_id if outcome and outcome.intervals_id else ""
             rows.append(["fallback", action.liftosaur_id, workout_start, kg_lifted, intervals_id, "", "", "", outcome_text, f"external_id={PROVENANCE.external_id(action.liftosaur_id)}"])
         else:
@@ -1763,7 +1801,7 @@ def print_strava_plan(
     rows: list[list[str]] = []
     for action in plan.actions:
         outcome = outcomes_by_liftosaur_id.get(action.liftosaur_id)
-        if action.kind == "upload":
+        if action.is_upload:
             rows.append(
                 [
                     "upload",

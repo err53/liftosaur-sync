@@ -43,7 +43,7 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(plan.actions[0].liftosaur_id, "123")
         self.assertEqual(plan.actions[0].intervals_id, "i1")
         self.assertEqual(plan.actions[0].match_kind, "time")
-        self.assertFalse(any(action.kind == "fallback" for action in plan.actions))
+        self.assertFalse(any(action.is_fallback for action in plan.actions))
 
     def test_existing_managed_block_matches_by_liftosaur_id_before_time(self):
         workout = LiftosaurWorkout(
