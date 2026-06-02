@@ -4,6 +4,7 @@ import os
 import urllib.parse
 import webbrowser
 
+from liftosaur_sync.api_models import StravaTokenResponse, parse_response
 from liftosaur_sync.http import http_form_json
 from liftosaur_sync.models import StravaTokens
 
@@ -132,13 +133,9 @@ def persist_env_value(path: str, key: str, value: str) -> None:
 
 
 def _strava_tokens_from_payload(payload: object) -> StravaTokens:
-    if not isinstance(payload, dict):
-        raise RuntimeError("Strava token response was not an object")
-    access_token = payload.get("access_token")
-    refresh_token = payload.get("refresh_token")
-    if not isinstance(access_token, str) or not access_token:
-        raise RuntimeError("Strava token response did not include access_token")
-    if not isinstance(refresh_token, str) or not refresh_token:
-        raise RuntimeError("Strava token response did not include refresh_token")
-    expires_at = payload.get("expires_at")
-    return StravaTokens(access_token, refresh_token, int(expires_at) if expires_at is not None else None)
+    response = parse_response(payload, StravaTokenResponse, "Strava token")
+    return StravaTokens(
+        response.access_token,
+        response.refresh_token,
+        int(response.expires_at) if response.expires_at is not None else None,
+    )

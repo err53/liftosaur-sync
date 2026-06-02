@@ -12,6 +12,16 @@ from zoneinfo import ZoneInfo
 
 from tabulate import tabulate
 
+from liftosaur_sync.api_models import (
+    IntervalsActivityResponse,
+    IntervalsManualActivityResponse,
+    IntervalsStreamResponse,
+    LiftosaurHistoryResponse,
+    StravaActivityResponse,
+    StravaUploadResponse,
+    StravaUploadStatusResponse,
+    parse_response,
+)
 from liftosaur_sync.auth import (
     authorize_strava_interactively,
     build_strava_authorize_url,
@@ -661,7 +671,7 @@ def run_intervals_command(args: argparse.Namespace) -> int:
     zone = ZoneInfo(timezone_name)
     since, until = _date_range(args, zone)
     liftosaur_records = fetch_liftosaur_history(since, until)
-    workouts = [parse_liftosaur_workout(record["id"], record["text"]) for record in liftosaur_records]
+    workouts = [parse_liftosaur_workout(record_id, text) for record_id, text in liftosaur_records]
     intervals_adapter = HttpIntervalsAdapter(require_env("INTERVALS_API_KEY"), require_env("INTERVALS_ATHLETE_ID"), timezone_name)
     activities = intervals_adapter.list_activities(since, until)
     plan = plan_sync(workouts, activities, PlanningOptions())
@@ -681,7 +691,7 @@ def run_strava_command(args: argparse.Namespace) -> int:
     zone = ZoneInfo(timezone_name)
     since, until = _date_range(args, zone)
     liftosaur_records = fetch_liftosaur_history(since, until)
-    workouts = [parse_liftosaur_workout(record["id"], record["text"]) for record in liftosaur_records]
+    workouts = [parse_liftosaur_workout(record_id, text) for record_id, text in liftosaur_records]
     intervals_adapter = HttpIntervalsAdapter(require_env("INTERVALS_API_KEY"), require_env("INTERVALS_ATHLETE_ID"), timezone_name)
     intervals_activities = intervals_adapter.list_activities(since, until)
     strava_adapter = HttpStravaAdapter(get_strava_access_token(), timezone_name)
@@ -704,7 +714,7 @@ def run_all_command(args: argparse.Namespace) -> int:
     zone = ZoneInfo(timezone_name)
     since, until = _date_range(args, zone)
     liftosaur_records = fetch_liftosaur_history(since, until)
-    workouts = [parse_liftosaur_workout(record["id"], record["text"]) for record in liftosaur_records]
+    workouts = [parse_liftosaur_workout(record_id, text) for record_id, text in liftosaur_records]
     intervals_adapter = HttpIntervalsAdapter(require_env("INTERVALS_API_KEY"), require_env("INTERVALS_ATHLETE_ID"), timezone_name)
     intervals_activities = intervals_adapter.list_activities(since, until)
     strava_adapter = HttpStravaAdapter(get_strava_access_token(), timezone_name)
@@ -746,9 +756,9 @@ def _date_range(args: argparse.Namespace, zone: ZoneInfo) -> tuple[date, date]:
     return since, until
 
 
-def fetch_liftosaur_history(since: date, until: date) -> list[dict[str, object]]:
+def fetch_liftosaur_history(since: date, until: date) -> list[tuple[int | str, str]]:
     api_key = require_env("LIFTOSAUR_API_KEY")
-    records: list[dict[str, object]] = []
+    records: list[tuple[int | str, str]] = []
     cursor: str | None = None
     while True:
         params = {"limit": "200", "startDate": since.isoformat(), "endDate": until.isoformat()}
@@ -759,11 +769,11 @@ def fetch_liftosaur_history(since: date, until: date) -> list[dict[str, object]]
             "https://www.liftosaur.com/api/v1/history?" + urllib.parse.urlencode(params),
             headers={"Authorization": f"Bearer {api_key}"},
         )
-        data = payload.get("data", {})
-        records.extend(data.get("records", []))
-        if not data.get("hasMore"):
+        response = parse_response(payload, LiftosaurHistoryResponse, "Liftosaur history")
+        records.extend((record.id, record.text) for record in response.data.records)
+        if not response.data.hasMore:
             break
-        cursor = str(data.get("nextCursor"))
+        cursor = str(response.data.nextCursor)
     return records
 
 
@@ -931,7 +941,8 @@ class HttpIntervalsAdapter(IntervalsAdapter):
             f"https://intervals.icu/api/v1/athlete/{urllib.parse.quote(self.athlete_id)}/activities?{params}",
             headers={"Authorization": self.auth},
         )
-        self.activities = [self._activity_from_item(item) for item in payload if not item.get("strava_id")]
+        items = parse_response(payload, list[IntervalsActivityResponse], "Intervals activities")
+        self.activities = [self._activity_from_item(item) for item in items if item.strava_id is None]
         return self.activities
 
     def update_activity(self, activity_id: str, update: dict[str, object]) -> None:
@@ -949,9 +960,10 @@ class HttpIntervalsAdapter(IntervalsAdapter):
             headers={"Authorization": self.auth, "Content-Type": "application/json"},
             body=[activity],
         )
-        if not isinstance(created, list) or not created or not isinstance(created[0], dict) or not created[0].get("id"):
+        created_activities = parse_response(created, list[IntervalsManualActivityResponse], "Intervals manual fallback upsert")
+        if not created_activities:
             raise RuntimeError("Intervals manual fallback upsert returned no activity id")
-        return str(created[0]["id"])
+        return str(created_activities[0].id)
 
     def fetch_hr_stream(self, activity_id: str) -> StravaHRStream | None:
         query = urllib.parse.urlencode([("types", "time"), ("types", "heartrate")])
@@ -962,20 +974,20 @@ class HttpIntervalsAdapter(IntervalsAdapter):
         )
         return _parse_intervals_hr_stream(payload)
 
-    def _activity_from_item(self, item: dict[str, object]) -> IntervalsActivity:
+    def _activity_from_item(self, item: IntervalsActivityResponse) -> IntervalsActivity:
         start = _parse_intervals_start(item, self.zone)
-        duration = item.get("elapsed_time") or item.get("moving_time")
+        duration = item.elapsed_time or item.moving_time
         return IntervalsActivity(
-            id=str(item["id"]),
-            type=item.get("type"),
+            id=str(item.id),
+            type=item.type,
             start=start,
             duration_seconds=int(duration) if duration is not None else None,
-            has_heartrate=item.get("has_heartrate"),
-            description=item.get("description"),
-            tags=item.get("tags"),
-            name=item.get("name"),
-            external_id=item.get("external_id"),
-            source=item.get("source"),
+            has_heartrate=item.has_heartrate,
+            description=item.description,
+            tags=item.tags,
+            name=item.name,
+            external_id=item.external_id,
+            source=item.source,
         )
 
 
@@ -1062,10 +1074,11 @@ class HttpStravaAdapter:
                 f"https://www.strava.com/api/v3/athlete/activities?{params}",
                 headers={"Authorization": f"Bearer {self.access_token}"},
             )
-            if not isinstance(payload, list) or not payload:
+            items = parse_response(payload, list[StravaActivityResponse], "Strava activities")
+            if not items:
                 break
-            activities.extend(_strava_activity_from_item(item) for item in payload if isinstance(item, dict))
-            if len(payload) < 200:
+            activities.extend(_strava_activity_from_item(item) for item in items)
+            if len(items) < 200:
                 break
             page += 1
         self.activities = activities
@@ -1094,9 +1107,8 @@ class HttpStravaAdapter:
             file_content=json.dumps(file_payload).encode(),
             file_content_type="application/json",
         )
-        if not isinstance(upload, dict) or not upload.get("id"):
-            raise RuntimeError("Strava upload returned no upload id")
-        return self._poll_upload(str(upload["id"]))
+        upload_response = parse_response(upload, StravaUploadResponse, "Strava upload")
+        return self._poll_upload(str(upload_response.id))
 
     def _poll_upload(self, upload_id: str) -> str:
         for _ in range(30):
@@ -1106,12 +1118,11 @@ class HttpStravaAdapter:
                 f"https://www.strava.com/api/v3/uploads/{urllib.parse.quote(upload_id)}",
                 headers={"Authorization": f"Bearer {self.access_token}"},
             )
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("error"):
-                raise RuntimeError(str(payload["error"]))
-            if payload.get("activity_id"):
-                return str(payload["activity_id"])
+            upload = parse_response(payload, StravaUploadStatusResponse, "Strava upload status")
+            if upload.error:
+                raise RuntimeError(upload.error)
+            if upload.activity_id:
+                return str(upload.activity_id)
         raise RuntimeError(f"Strava upload {upload_id} did not finish processing")
 
 
@@ -1179,26 +1190,23 @@ def _add_tags(existing: list[str] | None, tags: list[str]) -> list[str]:
     return result
 
 
-def _parse_intervals_start(item: dict[str, object], zone: ZoneInfo) -> datetime:
-    local_value = item.get("start_date_local")
-    if isinstance(local_value, str) and local_value:
+def _parse_intervals_start(item: IntervalsActivityResponse, zone: ZoneInfo) -> datetime:
+    if item.start_date_local:
+        local_value = item.start_date_local
         return datetime.fromisoformat(local_value).replace(tzinfo=zone).astimezone(timezone.utc)
-    start_value = item.get("start_date")
-    if isinstance(start_value, str) and start_value:
+    if item.start_date:
+        start_value = item.start_date
         return datetime.fromisoformat(start_value.replace("Z", "+00:00")).astimezone(timezone.utc)
-    raise ValueError(f"Intervals Activity {item.get('id')} has no start time")
+    raise ValueError(f"Intervals Activity {item.id} has no start time")
 
 
 def _parse_intervals_hr_stream(payload: object) -> StravaHRStream | None:
-    if not isinstance(payload, list):
-        return None
+    streams = parse_response(payload, list[IntervalsStreamResponse], "Intervals activity streams")
     time_values: list[int] | None = None
     hr_values: list[int | None] | None = None
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        stream_type = str(item.get("type") or item.get("name") or "").lower()
-        values = _stream_data_values(item.get("data"))
+    for item in streams:
+        stream_type = str(item.type or item.name or "").lower()
+        values = _stream_data_values(item.data)
         if not values:
             continue
         if stream_type in {"time", "timer_time", "secs", "seconds"}:
@@ -1222,19 +1230,17 @@ def _stream_data_values(data: object) -> list[object]:
     return []
 
 
-def _strava_activity_from_item(item: dict[str, object]) -> StravaActivity:
-    start_value = item.get("start_date")
-    if not isinstance(start_value, str) or not start_value:
-        raise ValueError(f"Strava Activity {item.get('id')} has no start time")
-    duration = item.get("elapsed_time") or item.get("moving_time")
+def _strava_activity_from_item(item: StravaActivityResponse) -> StravaActivity:
+    start_value = item.start_date
+    duration = item.elapsed_time or item.moving_time
     return StravaActivity(
-        id=str(item["id"]),
-        name=str(item.get("name")) if item.get("name") is not None else None,
-        sport_type=str(item.get("sport_type") or item.get("type")) if item.get("sport_type") or item.get("type") else None,
+        id=str(item.id),
+        name=item.name,
+        sport_type=item.sport_type or item.type,
         start=datetime.fromisoformat(start_value.replace("Z", "+00:00")).astimezone(timezone.utc),
         duration_seconds=int(duration) if duration is not None else None,
-        has_heartrate=bool(item.get("has_heartrate")) if item.get("has_heartrate") is not None else None,
-        external_id=str(item.get("external_id")) if item.get("external_id") is not None else None,
+        has_heartrate=item.has_heartrate,
+        external_id=item.external_id,
     )
 
 
