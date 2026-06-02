@@ -3,323 +3,48 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
 import re
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
-import webbrowser
-from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from tabulate import tabulate
 
-
-ELIGIBLE_INTERVALS_TYPES = {"WeightTraining", "Workout"}
-ELIGIBLE_STRAVA_TYPES = {"WeightTraining", "Workout", "Crossfit"}
-LB_TO_KG = 0.45359237
-MANAGED_START_TEMPLATE = "LIFTOSAUR-SYNC-START id={id}"
-MANAGED_END_TEMPLATE = "LIFTOSAUR-SYNC-END id={id}"
-STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
-STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
-STRAVA_DEFAULT_REDIRECT_URI = "http://localhost/exchange_token"
-STRAVA_SCOPES = ("activity:read_all", "activity:write")
-STRAVA_EXERCISE_TYPES = {
-    "Bench Press": "BARBELL_BENCH_PRESS",
-    "Deadlift": "BARBELL_DEADLIFT",
-    "Lat Pulldown": "LAT_PULLDOWN",
-    "Overhead Press": "OVERHEAD_BARBELL_PRESS",
-    "Squat": "BARBELL_BACK_SQUAT",
-}
-
-
-@dataclass(frozen=True)
-class LiftosaurSet:
-    repetitions: int
-    weight: float | None = None
-    unit: str | None = None
-
-
-@dataclass(frozen=True)
-class LiftosaurExercise:
-    name: str
-    work_sets: tuple[LiftosaurSet, ...]
-    warmup_sets: tuple[LiftosaurSet, ...] = ()
-    missed_sets: tuple[LiftosaurSet, ...] = ()
-
-
-@dataclass(frozen=True)
-class LiftosaurWorkout:
-    id: str
-    start: datetime
-    duration_seconds: int | None
-    text: str
-    summary: str
-    kg_lifted: float | None
-    program: str | None = None
-    day_name: str | None = None
-    exercises: tuple[LiftosaurExercise, ...] = ()
-
-
-class LiftosaurProvenance:
-    def external_id(self, workout_or_id: LiftosaurWorkout | str) -> str:
-        liftosaur_id = self._id(workout_or_id)
-        return f"liftosaur:{liftosaur_id}"
-
-    def matches_external_id(self, value: str | None, workout_or_id: LiftosaurWorkout | str) -> bool:
-        if not value:
-            return False
-        return value.removesuffix(".json") == self.external_id(workout_or_id)
-
-    def replace_intervals_managed_block(self, description: str | None, workout_or_id: LiftosaurWorkout | str, body: str) -> str:
-        liftosaur_id = self._id(workout_or_id)
-        start_marker = MANAGED_START_TEMPLATE.format(id=liftosaur_id)
-        end_marker = MANAGED_END_TEMPLATE.format(id=liftosaur_id)
-        block = f"{start_marker}\n{body}\n{end_marker}"
-        existing = description or ""
-        for pattern in self._managed_block_patterns(liftosaur_id):
-            if pattern.search(existing):
-                return pattern.sub(block, existing)
-        if existing.strip():
-            return existing.rstrip() + "\n\n" + block
-        return block
-
-    def has_intervals_managed_block(self, description: str | None, workout_or_id: LiftosaurWorkout | str) -> bool:
-        liftosaur_id = self._id(workout_or_id)
-        existing = description or ""
-        return any(pattern.search(existing) for pattern in self._managed_block_patterns(liftosaur_id))
-
-    def render_intervals_managed_block(self, workout: LiftosaurWorkout) -> str:
-        title = workout.day_name or workout.program or "Strength Training"
-        lines = [f"Liftosaur: {title}", f"Liftosaur history ID: {workout.id}"]
-        if workout.duration_seconds is not None:
-            lines.append(f"Duration: {workout.duration_seconds}s")
-        if workout.kg_lifted is not None:
-            lines.append(f"kg_lifted: {workout.kg_lifted:.3f}")
-        lines.append("")
-        lines.append(workout.summary)
-        lines.append("")
-        lines.append("Raw Liftosaur data:")
-        lines.append(workout.text)
-        return "\n".join(lines)
-
-    def render_strava_description(self, workout: LiftosaurWorkout, intervals_activity: "IntervalsActivity") -> str:
-        lines = ["Synced from Liftosaur."]
-        if workout.program:
-            lines.append(f"Program: {workout.program}")
-        if workout.day_name:
-            lines.append(f"Day: {workout.day_name}")
-        lines.append(f"Liftosaur history ID: {workout.id}")
-        if workout.kg_lifted is not None:
-            lines.append(f"kg_lifted: {workout.kg_lifted:.3f}")
-        lines.append(f"HR source: Intervals Activity {intervals_activity.id}")
-        return "\n".join(lines)
-
-    def _managed_block_patterns(self, liftosaur_id: str) -> list[re.Pattern[str]]:
-        plain_start = MANAGED_START_TEMPLATE.format(id=liftosaur_id)
-        plain_end = MANAGED_END_TEMPLATE.format(id=liftosaur_id)
-        html_start = f"<!-- liftosaur-sync:start id={liftosaur_id} -->"
-        html_end = f"<!-- liftosaur-sync:end id={liftosaur_id} -->"
-        return [
-            re.compile(re.escape(plain_start) + r".*?" + re.escape(plain_end), flags=re.DOTALL),
-            re.compile(re.escape(html_start) + r".*?" + re.escape(html_end), flags=re.DOTALL),
-        ]
-
-    def _id(self, workout_or_id: LiftosaurWorkout | str) -> str:
-        if isinstance(workout_or_id, LiftosaurWorkout):
-            return workout_or_id.id
-        return str(workout_or_id)
-
-
-PROVENANCE = LiftosaurProvenance()
-
-
-@dataclass(frozen=True)
-class IntervalsActivity:
-    id: str
-    type: str | None
-    start: datetime
-    duration_seconds: int | None
-    has_heartrate: bool | None
-    description: str | None
-    tags: list[str] | None
-    name: str | None = None
-    external_id: str | None = None
-    source: str | None = None
-
-
-@dataclass(frozen=True)
-class StravaActivity:
-    id: str
-    name: str | None
-    sport_type: str | None
-    start: datetime
-    duration_seconds: int | None
-    has_heartrate: bool | None
-    external_id: str | None = None
-
-
-@dataclass(frozen=True)
-class StravaHRStream:
-    time: list[int]
-    heartrate: list[int | None]
-
-
-@dataclass(frozen=True)
-class StructuredStravaUpload:
-    liftosaur_id: str
-    intervals_id: str
-    payload: dict[str, object]
-    warnings: tuple[str, ...] = ()
-
-    @property
-    def mapped_set_count(self) -> int:
-        sets = self.payload.get("sets", [])
-        return len(sets) if isinstance(sets, list) else 0
-
-
-@dataclass(frozen=True)
-class StravaSyncAction:
-    kind: str
-    liftosaur_id: str
-    intervals_id: str | None = None
-    strava_id: str | None = None
-    reason: str | None = None
-    mapped_set_count: int = 0
-    warnings: tuple[str, ...] = ()
-    upload: StructuredStravaUpload | None = None
-
-    @classmethod
-    def upload_activity(cls, upload: StructuredStravaUpload) -> "StravaSyncAction":
-        return cls(
-            "upload",
-            upload.liftosaur_id,
-            intervals_id=upload.intervals_id,
-            mapped_set_count=upload.mapped_set_count,
-            warnings=upload.warnings,
-            upload=upload,
-        )
-
-    @classmethod
-    def skip(
-        cls,
-        liftosaur_id: str,
-        reason: str,
-        intervals_id: str | None = None,
-        strava_id: str | None = None,
-        warnings: tuple[str, ...] = (),
-    ) -> "StravaSyncAction":
-        return cls("skip", liftosaur_id, intervals_id=intervals_id, strava_id=strava_id, reason=reason, warnings=warnings)
-
-    @property
-    def is_upload(self) -> bool:
-        return self.kind == "upload"
-
-    @property
-    def is_skip(self) -> bool:
-        return self.kind == "skip"
-
-
-@dataclass(frozen=True)
-class StravaSyncPlan:
-    actions: list[StravaSyncAction]
-    warnings: list[str]
-
-
-@dataclass(frozen=True)
-class PlanningOptions:
-    eligible_types: set[str] = field(default_factory=lambda: set(ELIGIBLE_INTERVALS_TYPES))
-    overlap_seconds: int = 10 * 60
-    start_tolerance_seconds: int = 30 * 60
-    default_duration_seconds: int | None = None
-
-
-@dataclass(frozen=True)
-class SyncAction:
-    kind: str
-    liftosaur_id: str
-    intervals_id: str | None = None
-    reason: str | None = None
-    match_kind: str | None = None
-    warnings: tuple[str, ...] = ()
-
-    @classmethod
-    def enrich(
-        cls,
-        liftosaur_id: str,
-        intervals_id: str,
-        match_kind: str,
-        warnings: tuple[str, ...] = (),
-    ) -> "SyncAction":
-        return cls("enrich", liftosaur_id, intervals_id=intervals_id, match_kind=match_kind, warnings=warnings)
-
-    @classmethod
-    def fallback(cls, liftosaur_id: str, intervals_id: str | None = None) -> "SyncAction":
-        return cls("fallback", liftosaur_id, intervals_id=intervals_id)
-
-    @classmethod
-    def skip(cls, liftosaur_id: str, reason: str) -> "SyncAction":
-        return cls("skip", liftosaur_id, reason=reason)
-
-    @property
-    def is_enrich(self) -> bool:
-        return self.kind == "enrich"
-
-    @property
-    def is_fallback(self) -> bool:
-        return self.kind == "fallback"
-
-    @property
-    def is_skip(self) -> bool:
-        return self.kind == "skip"
-
-
-@dataclass(frozen=True)
-class SyncPlan:
-    actions: list[SyncAction]
-    warnings: list[str]
-
-
-@dataclass(frozen=True)
-class WriteOutcome:
-    liftosaur_id: str
-    status: str
-    intervals_id: str | None = None
-    reason: str | None = None
-    detail: str | None = None
-
-
-@dataclass(frozen=True)
-class StravaWriteOutcome:
-    liftosaur_id: str
-    status: str
-    strava_id: str | None = None
-    reason: str | None = None
-    detail: str | None = None
-
-
-@dataclass(frozen=True)
-class MatchCandidate:
-    activity: object
-    overlap_seconds: int
-    start_delta_seconds: float
-
-
-@dataclass(frozen=True)
-class IntervalsTimeMatchIndex:
-    candidates_by_workout: dict[str, list[MatchCandidate]]
-    ambiguous_workout_ids: set[str]
-    warnings: list[str]
-
-
-@dataclass(frozen=True)
-class StravaTokens:
-    access_token: str
-    refresh_token: str
-    expires_at: int | None = None
+from liftosaur_sync.auth import (
+    authorize_strava_interactively,
+    build_strava_authorize_url,
+    extract_strava_code,
+    get_strava_access_token,
+    load_dotenv,
+    persist_env_value,
+    require_env,
+)
+from liftosaur_sync.http import http_json as _http_json
+from liftosaur_sync.http import http_multipart_json as _http_multipart_json
+from liftosaur_sync.models import (
+    ELIGIBLE_STRAVA_TYPES,
+    LB_TO_KG,
+    STRAVA_EXERCISE_TYPES,
+    IntervalsActivity,
+    IntervalsTimeMatchIndex,
+    LiftosaurExercise,
+    LiftosaurSet,
+    LiftosaurWorkout,
+    MatchCandidate,
+    PlanningOptions,
+    StravaActivity,
+    StravaHRStream,
+    StravaSyncAction,
+    StravaSyncPlan,
+    StravaWriteOutcome,
+    StructuredStravaUpload,
+    SyncAction,
+    SyncPlan,
+    WriteOutcome,
+)
+from liftosaur_sync.provenance import PROVENANCE
 
 
 def parse_liftosaur_workout(record_id: int | str, text: str) -> LiftosaurWorkout:
@@ -1014,148 +739,6 @@ def run_all_command(args: argparse.Namespace) -> int:
     return 1 if any(outcome.status == "failed" for outcome in intervals_outcomes + strava_outcomes) else 0
 
 
-def load_dotenv(path: str = ".env") -> None:
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as file:
-        for line in file:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or "=" not in stripped:
-                continue
-            key, value = stripped.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-def require_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise SystemExit(f"Missing required environment variable: {name}")
-    return value
-
-
-def authorize_strava_interactively(redirect_uri: str | None = None, env_path: str = ".env") -> StravaTokens:
-    client_id = require_env("STRAVA_CLIENT_ID")
-    client_secret = require_env("STRAVA_CLIENT_SECRET")
-    redirect_uri = redirect_uri or os.environ.get("STRAVA_REDIRECT_URI") or STRAVA_DEFAULT_REDIRECT_URI
-    url = build_strava_authorize_url(client_id, redirect_uri)
-    print("Open this Strava authorization URL:")
-    print(url)
-    webbrowser.open(url)
-    redirected = input("Paste the full redirected URL, or just the code parameter: ").strip()
-    code = extract_strava_code(redirected)
-    tokens = exchange_strava_code(client_id, client_secret, code)
-    persist_env_value(env_path, "STRAVA_REFRESH_TOKEN", tokens.refresh_token)
-    if redirect_uri != STRAVA_DEFAULT_REDIRECT_URI:
-        persist_env_value(env_path, "STRAVA_REDIRECT_URI", redirect_uri)
-    os.environ["STRAVA_REFRESH_TOKEN"] = tokens.refresh_token
-    return tokens
-
-
-def get_strava_access_token(env_path: str = ".env", interactive: bool = True) -> str:
-    client_id = require_env("STRAVA_CLIENT_ID")
-    client_secret = require_env("STRAVA_CLIENT_SECRET")
-    refresh_token = os.environ.get("STRAVA_REFRESH_TOKEN")
-    if not refresh_token:
-        if not interactive:
-            raise SystemExit("Missing required environment variable: STRAVA_REFRESH_TOKEN")
-        return authorize_strava_interactively(env_path=env_path).access_token
-    tokens = refresh_strava_access_token(client_id, client_secret, refresh_token)
-    if tokens.refresh_token != refresh_token:
-        persist_env_value(env_path, "STRAVA_REFRESH_TOKEN", tokens.refresh_token)
-        os.environ["STRAVA_REFRESH_TOKEN"] = tokens.refresh_token
-    return tokens.access_token
-
-
-def build_strava_authorize_url(client_id: str, redirect_uri: str, scopes: tuple[str, ...] = STRAVA_SCOPES) -> str:
-    params = {
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "response_type": "code",
-        "approval_prompt": "auto",
-        "scope": ",".join(scopes),
-    }
-    return STRAVA_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
-
-
-def extract_strava_code(value: str) -> str:
-    if not value:
-        raise ValueError("Strava OAuth response is empty")
-    parsed = urllib.parse.urlparse(value)
-    if parsed.query:
-        params = urllib.parse.parse_qs(parsed.query)
-        if params.get("error"):
-            raise ValueError(f"Strava OAuth failed: {params['error'][0]}")
-        codes = params.get("code")
-        if codes and codes[0]:
-            return codes[0]
-    return value
-
-
-def exchange_strava_code(client_id: str, client_secret: str, code: str) -> StravaTokens:
-    payload = _http_form_json(
-        "POST",
-        STRAVA_TOKEN_URL,
-        {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "grant_type": "authorization_code",
-        },
-    )
-    return _strava_tokens_from_payload(payload)
-
-
-def refresh_strava_access_token(client_id: str, client_secret: str, refresh_token: str) -> StravaTokens:
-    payload = _http_form_json(
-        "POST",
-        STRAVA_TOKEN_URL,
-        {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-        },
-    )
-    return _strava_tokens_from_payload(payload)
-
-
-def _strava_tokens_from_payload(payload: object) -> StravaTokens:
-    if not isinstance(payload, dict):
-        raise RuntimeError("Strava token response was not an object")
-    access_token = payload.get("access_token")
-    refresh_token = payload.get("refresh_token")
-    if not isinstance(access_token, str) or not access_token:
-        raise RuntimeError("Strava token response did not include access_token")
-    if not isinstance(refresh_token, str) or not refresh_token:
-        raise RuntimeError("Strava token response did not include refresh_token")
-    expires_at = payload.get("expires_at")
-    return StravaTokens(access_token, refresh_token, int(expires_at) if expires_at is not None else None)
-
-
-def persist_env_value(path: str, key: str, value: str) -> None:
-    line = f"{key}={value}\n"
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as file:
-            lines = file.readlines()
-    else:
-        lines = []
-    replaced = False
-    next_lines: list[str] = []
-    for existing in lines:
-        stripped = existing.strip()
-        if stripped and not stripped.startswith("#") and stripped.split("=", 1)[0].strip() == key:
-            next_lines.append(line)
-            replaced = True
-        else:
-            next_lines.append(existing)
-    if not replaced:
-        if next_lines and not next_lines[-1].endswith("\n"):
-            next_lines[-1] += "\n"
-        next_lines.append(line)
-    with open(path, "w", encoding="utf-8") as file:
-        file.writelines(next_lines)
-
-
 def _date_range(args: argparse.Namespace, zone: ZoneInfo) -> tuple[date, date]:
     if args.since:
         since = date.fromisoformat(args.since)
@@ -1655,97 +1238,6 @@ def _strava_activity_from_item(item: dict[str, object]) -> StravaActivity:
         has_heartrate=bool(item.get("has_heartrate")) if item.get("has_heartrate") is not None else None,
         external_id=str(item.get("external_id")) if item.get("external_id") is not None else None,
     )
-
-
-def _http_json(method: str, url: str, headers: dict[str, str], body: object | None = None) -> object:
-    return _http_json_with_retry(method, url, headers, body)
-
-
-def _http_form_json(method: str, url: str, body: dict[str, str]) -> object:
-    data = urllib.parse.urlencode(body).encode()
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "liftosaur-sync/2.0.0",
-        },
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read().decode()
-            return json.loads(raw) if raw else None
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode(errors="replace")
-        raise RuntimeError(f"{method} {url} failed with HTTP {error.code}: {detail}") from error
-
-
-def _http_multipart_json(
-    method: str,
-    url: str,
-    headers: dict[str, str],
-    fields: dict[str, str],
-    file_field: str,
-    filename: str,
-    file_content: bytes,
-    file_content_type: str,
-) -> object:
-    boundary = f"liftosaur-sync-{int(time.time() * 1000)}"
-    parts: list[bytes] = []
-    for key, value in fields.items():
-        parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
-        )
-    parts.append(
-        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\nContent-Type: {file_content_type}\r\n\r\n'.encode()
-        + file_content
-        + b"\r\n"
-    )
-    parts.append(f"--{boundary}--\r\n".encode())
-    request = urllib.request.Request(
-        url,
-        data=b"".join(parts),
-        headers={
-            "Accept": "application/json",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "liftosaur-sync/2.0.0",
-            **headers,
-        },
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read().decode()
-            return json.loads(raw) if raw else None
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode(errors="replace")
-        raise RuntimeError(f"{method} {url} failed with HTTP {error.code}: {detail}") from error
-
-
-def _http_json_with_retry(method: str, url: str, headers: dict[str, str], body: object | None) -> object:
-    merged_headers = {"Accept": "application/json", "User-Agent": "liftosaur-sync/2.0.0", **headers}
-    data = json.dumps(body).encode() if body is not None else None
-    retryable_statuses = {429, 500, 502, 503, 504}
-    for attempt in range(4):
-        request = urllib.request.Request(url, data=data, headers=merged_headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                raw = response.read().decode()
-                return json.loads(raw) if raw else None
-        except urllib.error.HTTPError as error:
-            if error.code not in retryable_statuses or attempt == 3:
-                detail = error.read().decode(errors="replace")
-                raise RuntimeError(f"{method} {url} failed with HTTP {error.code}: {detail}") from error
-            retry_after = error.headers.get("Retry-After")
-            delay = int(retry_after) if retry_after and retry_after.isdigit() else 2**attempt
-            time.sleep(delay)
-        except (TimeoutError, ConnectionError, urllib.error.URLError):
-            if attempt == 3:
-                raise
-            time.sleep(2**attempt)
-    raise RuntimeError(f"{method} {url} failed")
 
 
 def _intervals_auth_header(api_key: str) -> str:
