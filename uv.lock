@@ -3,9 +3,9 @@ revision = 3
 requires-python = ">=3.13"
 
 [[package]]
-name = "liftosaur-intervals-sync"
-version = "0.1.0"
-source = { virtual = "." }
+name = "liftosaur-sync"
+version = "1.1.1"
+source = { editable = "." }
 dependencies = [
     { name = "tabulate" },
 ]

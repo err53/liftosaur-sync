@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timezone
 
-from liftosaur_intervals_sync import (
+from liftosaur_sync import (
     IntervalsActivity,
     LiftosaurWorkout,
     PlanningOptions,
@@ -169,6 +169,20 @@ class ParserAndRenderingTests(unittest.TestCase):
         self.assertIn("Missed: 2x0 @ 220 lb", workout.summary)
         expected_kg = ((4 * 3 * 70) + (1 * 6 * 70) + (8 * 1 * 220)) * 0.45359237
         self.assertAlmostEqual(workout.kg_lifted or 0, expected_kg, places=3)
+
+    def test_liftosaur_comments_do_not_make_tonnage_unsafe(self):
+        text = """2026-06-01 21:50:31 +00:00 / program: "GZCLP" / dayName: "Day 3" / duration: 3659s / exercises: {
+  Bench Press / 4x3 85lb, 1x10 85lb / warmup: 1x5 65lb / target: 4x3 85lb, 1x3+ 85lb
+  // deload to 130 next week
+  Squat / 1x6 155lb, 1x5 155lb, 1x4 155lb / warmup: 1x5 45lb, 1x5 75lb, 1x5 120lb / target: 3x10 155lb
+  Lat Pulldown / 3x15 70lb / warmup: 1x5 20lb, 1x5 35lb, 1x5 55lb / target: 2x15 70lb 90s, 1x15+ 70lb 90s
+}"""
+
+        workout = parse_liftosaur_workout(1780350631729, text)
+
+        expected_kg = ((4 * 3 * 85) + (1 * 10 * 85) + (1 * 6 * 155) + (1 * 5 * 155) + (1 * 4 * 155) + (3 * 15 * 70)) * 0.45359237
+        self.assertAlmostEqual(workout.kg_lifted or 0, expected_kg, places=3)
+        self.assertNotIn("// deload", workout.summary)
 
     def test_replaces_only_managed_block(self):
         original = "User text\nLIFTOSAUR-SYNC-START id=123\nOld\nLIFTOSAUR-SYNC-END id=123\nFooter"

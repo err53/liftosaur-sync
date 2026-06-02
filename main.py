@@ -1,4 +1,4 @@
-from liftosaur_intervals_sync import main
+from liftosaur_sync import main
 
 
 if __name__ == "__main__":

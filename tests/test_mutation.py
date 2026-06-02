@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime
 
-from liftosaur_intervals_sync import (
+from liftosaur_sync import (
     InMemoryIntervalsAdapter,
     IntervalsActivity,
     LiftosaurWorkout,

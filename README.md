@@ -1,6 +1,6 @@
-# Liftosaur Intervals Sync
+# Liftosaur Sync
 
-Dry-run planner for enriching Intervals.icu strength activities with Liftosaur workout history.
+Sync Liftosaur workout history to supported targets. The current target is Intervals.icu.
 
 ## Configuration
 
@@ -20,12 +20,14 @@ SYNC_TIMEZONE=America/New_York
 ```sh
 uv run python main.py --days 14
 uv run python main.py --days 14 --json
+uv run liftosaur-sync --days 14
 ```
 
 ## Apply
 
 ```sh
 uv run python main.py --days 14 --apply
+uv run liftosaur-sync --days 14 --apply
 ```
 
 `--apply` enriches Time Matched Intervals Activities with a plain-text managed Liftosaur description block, `kg_lifted` when computed, and the `liftosaur` tag. On later runs, the managed block's Liftosaur history ID is used before Time Match so the same Intervals Activity is updated again. It creates or updates Manual Fallback Activities only when no eligible Time Match exists.

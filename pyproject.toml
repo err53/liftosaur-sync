@@ -1,7 +1,7 @@
 [project]
-name = "liftosaur-intervals-sync"
-version = "0.1.0"
-description = "Add your description here"
+name = "liftosaur-sync"
+version = "1.1.1"
+description = "Sync Liftosaur workout history to supported targets"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -9,4 +9,8 @@ dependencies = [
 ]
 
 [project.scripts]
-liftosaur-intervals-sync = "liftosaur_intervals_sync:main"
+liftosaur-sync = "liftosaur_sync:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

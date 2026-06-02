@@ -1,6 +1,6 @@
-# Liftosaur Intervals Sync
+# Liftosaur Sync
 
-This context describes the language for synchronizing strength training records from Liftosaur into Intervals.icu.
+This context describes the language for synchronizing strength training records from Liftosaur into supported targets. The current target is Intervals.icu.
 
 ## Language
 

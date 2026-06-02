@@ -321,7 +321,11 @@ def _exercise_lines(text: str) -> list[str]:
     if "exercises:" not in text:
         return []
     after = text.split("exercises:", 1)[1]
-    return [line.strip() for line in after.splitlines() if line.strip() and line.strip() not in {"{", "}"}]
+    return [
+        line.strip()
+        for line in after.splitlines()
+        if line.strip() and line.strip() not in {"{", "}"} and not line.strip().startswith("//")
+    ]
 
 
 def _section(parts: list[str], name: str) -> str | None:
@@ -753,7 +757,7 @@ def _http_json(method: str, url: str, headers: dict[str, str], body: object | No
 
 
 def _http_json_with_retry(method: str, url: str, headers: dict[str, str], body: object | None) -> object:
-    merged_headers = {"Accept": "application/json", "User-Agent": "liftosaur-intervals-sync/0.1", **headers}
+    merged_headers = {"Accept": "application/json", "User-Agent": "liftosaur-sync/1.1.1", **headers}
     data = json.dumps(body).encode() if body is not None else None
     retryable_statuses = {429, 500, 502, 503, 504}
     for attempt in range(4):
@@ -795,23 +799,24 @@ def print_plan(
     for action in plan.actions:
         workout = workouts_by_id.get(action.liftosaur_id)
         workout_start = _format_display_time(workout.start) if workout else "unknown"
+        kg_lifted = _format_kg_lifted(workout.kg_lifted) if workout else ""
         outcome = outcomes_by_liftosaur_id.get(action.liftosaur_id)
         outcome_text = outcome.status if outcome else ""
         if action.kind == "enrich":
             activity = activities_by_id.get(action.intervals_id or "")
             hr = "hr=yes" if activity and activity.has_heartrate else "hr=no"
             activity_start = _format_display_time(activity.start) if activity else "unknown"
-            rows.append(["enrich", action.liftosaur_id, workout_start, action.intervals_id or "", activity_start, action.match_kind or "", hr, outcome_text, _outcome_note(outcome)])
+            rows.append(["enrich", action.liftosaur_id, workout_start, kg_lifted, action.intervals_id or "", activity_start, action.match_kind or "", hr, outcome_text, _outcome_note(outcome)])
         elif action.kind == "fallback":
             intervals_id = outcome.intervals_id if outcome and outcome.intervals_id else ""
-            rows.append(["fallback", action.liftosaur_id, workout_start, intervals_id, "", "", "", outcome_text, f"external_id=liftosaur:{action.liftosaur_id}"])
+            rows.append(["fallback", action.liftosaur_id, workout_start, kg_lifted, intervals_id, "", "", "", outcome_text, f"external_id=liftosaur:{action.liftosaur_id}"])
         else:
-            rows.append(["skip", action.liftosaur_id, workout_start, "", "", "", "", outcome_text, action.reason or ""])
+            rows.append(["skip", action.liftosaur_id, workout_start, kg_lifted, "", "", "", "", outcome_text, action.reason or ""])
     print(f"Generated: {generated_at}")
     print(
         tabulate(
             rows,
-            headers=["Action", "Liftosaur ID", "Liftosaur Start", "Intervals ID", "Intervals Start", "Match", "HR", "Outcome", "Note"],
+            headers=["Action", "Liftosaur ID", "Liftosaur Start", "kg_lifted", "Intervals ID", "Intervals Start", "Match", "HR", "Outcome", "Note"],
             tablefmt="github",
         )
     )
@@ -821,6 +826,10 @@ def print_plan(
 
 def _format_display_time(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _format_kg_lifted(value: float | None) -> str:
+    return "" if value is None else f"{value:.3f}"
 
 
 def _outcome_note(outcome: WriteOutcome | None) -> str:
@@ -848,6 +857,9 @@ def _plan_to_json(
                 "kind": action.kind,
                 "liftosaur_id": action.liftosaur_id,
                 "liftosaur_start": workouts_by_id[action.liftosaur_id].start.isoformat()
+                if action.liftosaur_id in workouts_by_id
+                else None,
+                "kg_lifted": workouts_by_id[action.liftosaur_id].kg_lifted
                 if action.liftosaur_id in workouts_by_id
                 else None,
                 "intervals_id": action.intervals_id,
