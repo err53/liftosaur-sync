@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -18,9 +19,36 @@ from tabulate import tabulate
 
 
 ELIGIBLE_INTERVALS_TYPES = {"WeightTraining", "Workout"}
+ELIGIBLE_STRAVA_TYPES = {"WeightTraining", "Workout", "Crossfit"}
 LB_TO_KG = 0.45359237
 MANAGED_START_TEMPLATE = "LIFTOSAUR-SYNC-START id={id}"
 MANAGED_END_TEMPLATE = "LIFTOSAUR-SYNC-END id={id}"
+STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
+STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
+STRAVA_DEFAULT_REDIRECT_URI = "http://localhost/exchange_token"
+STRAVA_SCOPES = ("activity:read_all", "activity:write")
+STRAVA_EXERCISE_TYPES = {
+    "Bench Press": "BARBELL_BENCH_PRESS",
+    "Deadlift": "BARBELL_DEADLIFT",
+    "Lat Pulldown": "LAT_PULLDOWN",
+    "Overhead Press": "OVERHEAD_BARBELL_PRESS",
+    "Squat": "BARBELL_BACK_SQUAT",
+}
+
+
+@dataclass(frozen=True)
+class LiftosaurSet:
+    repetitions: int
+    weight: float | None = None
+    unit: str | None = None
+
+
+@dataclass(frozen=True)
+class LiftosaurExercise:
+    name: str
+    work_sets: tuple[LiftosaurSet, ...]
+    warmup_sets: tuple[LiftosaurSet, ...] = ()
+    missed_sets: tuple[LiftosaurSet, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -33,6 +61,7 @@ class LiftosaurWorkout:
     kg_lifted: float | None
     program: str | None = None
     day_name: str | None = None
+    exercises: tuple[LiftosaurExercise, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -47,6 +76,40 @@ class IntervalsActivity:
     name: str | None = None
     external_id: str | None = None
     source: str | None = None
+
+
+@dataclass(frozen=True)
+class StravaActivity:
+    id: str
+    name: str | None
+    sport_type: str | None
+    start: datetime
+    duration_seconds: int | None
+    has_heartrate: bool | None
+    external_id: str | None = None
+
+
+@dataclass(frozen=True)
+class StravaHRStream:
+    time: list[int]
+    heartrate: list[int | None]
+
+
+@dataclass(frozen=True)
+class StravaSyncAction:
+    kind: str
+    liftosaur_id: str
+    intervals_id: str | None = None
+    strava_id: str | None = None
+    reason: str | None = None
+    mapped_set_count: int = 0
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StravaSyncPlan:
+    actions: list[StravaSyncAction]
+    warnings: list[str]
 
 
 @dataclass(frozen=True)
@@ -83,10 +146,26 @@ class WriteOutcome:
 
 
 @dataclass(frozen=True)
+class StravaWriteOutcome:
+    liftosaur_id: str
+    status: str
+    strava_id: str | None = None
+    reason: str | None = None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
 class MatchCandidate:
     activity: IntervalsActivity
     overlap_seconds: int
     start_delta_seconds: float
+
+
+@dataclass(frozen=True)
+class StravaTokens:
+    access_token: str
+    refresh_token: str
+    expires_at: int | None = None
 
 
 def parse_liftosaur_workout(record_id: int | str, text: str) -> LiftosaurWorkout:
@@ -96,7 +175,7 @@ def parse_liftosaur_workout(record_id: int | str, text: str) -> LiftosaurWorkout
     duration = _int_metadata(metadata, "duration")
     program = _quoted_metadata(metadata, "program")
     day_name = _quoted_metadata(metadata, "dayName")
-    summary, kg_lifted = _parse_exercises(text)
+    summary, kg_lifted, exercises = _parse_exercises(text)
     return LiftosaurWorkout(
         id=str(record_id),
         start=start,
@@ -106,6 +185,7 @@ def parse_liftosaur_workout(record_id: int | str, text: str) -> LiftosaurWorkout
         kg_lifted=kg_lifted,
         program=program,
         day_name=day_name,
+        exercises=exercises,
     )
 
 
@@ -217,6 +297,238 @@ def plan_sync(
     return SyncPlan(actions=[actions_by_workout[workout.id] for workout in workouts], warnings=warnings)
 
 
+def plan_strava_sync(
+    workouts: list[LiftosaurWorkout],
+    intervals_activities: list[IntervalsActivity],
+    strava_activities: list[StravaActivity],
+    hr_streams_by_intervals_id: dict[str, StravaHRStream],
+    timezone_name: str,
+    options: PlanningOptions | None = None,
+) -> StravaSyncPlan:
+    options = options or PlanningOptions()
+    warnings: list[str] = []
+    actions: list[StravaSyncAction] = []
+    for workout in workouts:
+        expected_external_id = f"liftosaur:{workout.id}"
+        external_matches = [
+            activity for activity in strava_activities if _normalize_strava_external_id(activity.external_id) == expected_external_id
+        ]
+        if external_matches:
+            if len(external_matches) > 1:
+                warnings.append(f"Liftosaur Workout {workout.id} has multiple Strava external ID matches")
+            actions.append(
+                StravaSyncAction("skip", workout.id, strava_id=external_matches[0].id, reason="already uploaded")
+            )
+            continue
+
+        strava_time_matches = [
+            activity
+            for activity in strava_activities
+            if activity.sport_type in ELIGIBLE_STRAVA_TYPES and _time_matches_activity(workout, activity.start, activity.duration_seconds, options)
+        ]
+        if strava_time_matches:
+            if len(strava_time_matches) > 1:
+                warnings.append(f"Liftosaur Workout {workout.id} has multiple existing Strava Time Matches")
+            actions.append(
+                StravaSyncAction("skip", workout.id, strava_id=strava_time_matches[0].id, reason="existing Strava Time Match")
+            )
+            continue
+
+        intervals_match = _choose_intervals_hr_source(workout, intervals_activities, options)
+        if intervals_match is None:
+            actions.append(StravaSyncAction("skip", workout.id, reason="missing Intervals Time Match"))
+            continue
+        hr_stream = hr_streams_by_intervals_id.get(intervals_match.activity.id)
+        if hr_stream is None or not hr_stream.time or not hr_stream.heartrate:
+            actions.append(
+                StravaSyncAction("skip", workout.id, intervals_id=intervals_match.activity.id, reason="missing HR stream")
+            )
+            continue
+
+        unmapped = _unmapped_work_exercise_names(workout)
+        if unmapped:
+            warning = f"Liftosaur Workout {workout.id} has unmapped exercises: {', '.join(unmapped)}"
+            warnings.append(warning)
+            actions.append(
+                StravaSyncAction(
+                    "skip",
+                    workout.id,
+                    intervals_id=intervals_match.activity.id,
+                    reason="unmapped exercises",
+                    warnings=(warning,),
+                )
+            )
+            continue
+
+        try:
+            payload, action_warnings = build_strava_upload_payload(workout, intervals_match.activity, hr_stream, timezone_name)
+        except ValueError as error:
+            actions.append(
+                StravaSyncAction("skip", workout.id, intervals_id=intervals_match.activity.id, reason=str(error))
+            )
+            continue
+        warnings.extend(action_warnings)
+        actions.append(
+            StravaSyncAction(
+                "upload",
+                workout.id,
+                intervals_id=intervals_match.activity.id,
+                mapped_set_count=len(payload["sets"]),
+                warnings=tuple(action_warnings),
+            )
+        )
+    return StravaSyncPlan(actions, warnings)
+
+
+def build_strava_upload_payload(
+    workout: LiftosaurWorkout,
+    intervals_activity: IntervalsActivity,
+    hr_stream: StravaHRStream,
+    timezone_name: str,
+) -> tuple[dict[str, object], list[str]]:
+    if workout.duration_seconds is None:
+        raise ValueError("missing duration")
+    sets = _strava_sets_for_workout(workout)
+    if not sets:
+        raise ValueError("no mapped work sets")
+    stream, warnings = _align_hr_stream(workout, intervals_activity, hr_stream)
+    payload: dict[str, object] = {
+        "version": "1.0",
+        "start_time": _isoformat_z(workout.start),
+        "utc_offset": _utc_offset_seconds(workout.start, timezone_name),
+        "elapsed_time": workout.duration_seconds,
+        "name": _strava_upload_name(workout),
+        "description": _strava_upload_description(workout, intervals_activity),
+        "external_id": f"liftosaur:{workout.id}",
+        "sport_type": "WeightTraining",
+        "streams": stream,
+        "sets": sets,
+    }
+    return payload, warnings
+
+
+def _normalize_strava_external_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value.removesuffix(".json")
+
+
+def _time_matches_activity(
+    workout: LiftosaurWorkout,
+    activity_start: datetime,
+    activity_duration_seconds: int | None,
+    options: PlanningOptions,
+) -> bool:
+    start_delta = abs((workout.start - activity_start).total_seconds())
+    overlap = _overlap_seconds(workout.start, workout.duration_seconds, activity_start, activity_duration_seconds)
+    return overlap >= options.overlap_seconds or start_delta <= options.start_tolerance_seconds
+
+
+def _choose_intervals_hr_source(
+    workout: LiftosaurWorkout,
+    intervals_activities: list[IntervalsActivity],
+    options: PlanningOptions,
+) -> MatchCandidate | None:
+    candidates = [
+        candidate
+        for activity in intervals_activities
+        if activity.type in options.eligible_types and activity.has_heartrate
+        for candidate in [_time_match_candidate(workout, activity, options)]
+        if candidate is not None
+    ]
+    return _choose_candidate(candidates) if candidates else None
+
+
+def _unmapped_work_exercise_names(workout: LiftosaurWorkout) -> list[str]:
+    return sorted(
+        exercise.name
+        for exercise in workout.exercises
+        if exercise.work_sets and exercise.name not in STRAVA_EXERCISE_TYPES
+    )
+
+
+def _strava_sets_for_workout(workout: LiftosaurWorkout) -> list[dict[str, object]]:
+    sets: list[dict[str, object]] = []
+    for exercise in workout.exercises:
+        exercise_type = STRAVA_EXERCISE_TYPES.get(exercise.name)
+        if not exercise_type:
+            continue
+        for set_ in exercise.work_sets:
+            if set_.repetitions <= 0:
+                continue
+            item: dict[str, object] = {"exercise_type": exercise_type, "repetitions": set_.repetitions}
+            weight = _weight_kg(set_.weight, set_.unit)
+            if weight is not None:
+                item["weight"] = round(weight, 3)
+            sets.append(item)
+    return sets
+
+
+def _weight_kg(weight: float | None, unit: str | None) -> float | None:
+    if weight is None:
+        return None
+    if unit == "lb":
+        return weight * LB_TO_KG
+    if unit == "kg":
+        return weight
+    return None
+
+
+def _align_hr_stream(
+    workout: LiftosaurWorkout,
+    intervals_activity: IntervalsActivity,
+    hr_stream: StravaHRStream,
+) -> tuple[dict[str, list[int]], list[str]]:
+    if workout.duration_seconds is None:
+        raise ValueError("missing duration")
+    offset = int(round((intervals_activity.start - workout.start).total_seconds()))
+    times: list[int] = []
+    heartrates: list[int] = []
+    for source_time, hr in zip(hr_stream.time, hr_stream.heartrate):
+        if hr is None:
+            continue
+        aligned_time = offset + int(source_time)
+        if 0 <= aligned_time <= workout.duration_seconds:
+            times.append(aligned_time)
+            heartrates.append(int(hr))
+    if not times:
+        raise ValueError("missing HR stream")
+    warnings: list[str] = []
+    if workout.duration_seconds > 0 and len(times) > 1:
+        coverage = (times[-1] - times[0]) / workout.duration_seconds
+        if coverage < 0.5:
+            warnings.append(f"Liftosaur Workout {workout.id} has HR coverage below 50%")
+    return {"time": times, "heartrate": heartrates}, warnings
+
+
+def _strava_upload_name(workout: LiftosaurWorkout) -> str:
+    if workout.program and workout.day_name:
+        return f"{workout.program} - {workout.day_name}"
+    return workout.program or workout.day_name or "Strength Training"
+
+
+def _strava_upload_description(workout: LiftosaurWorkout, intervals_activity: IntervalsActivity) -> str:
+    lines = ["Synced from Liftosaur."]
+    if workout.program:
+        lines.append(f"Program: {workout.program}")
+    if workout.day_name:
+        lines.append(f"Day: {workout.day_name}")
+    lines.append(f"Liftosaur history ID: {workout.id}")
+    if workout.kg_lifted is not None:
+        lines.append(f"kg_lifted: {workout.kg_lifted:.3f}")
+    lines.append(f"HR source: Intervals Activity {intervals_activity.id}")
+    return "\n".join(lines)
+
+
+def _isoformat_z(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _utc_offset_seconds(value: datetime, timezone_name: str) -> int:
+    offset = value.astimezone(ZoneInfo(timezone_name)).utcoffset()
+    return int(offset.total_seconds()) if offset is not None else 0
+
+
 def replace_managed_block(description: str | None, liftosaur_id: str, body: str) -> str:
     start_marker = MANAGED_START_TEMPLATE.format(id=liftosaur_id)
     end_marker = MANAGED_END_TEMPLATE.format(id=liftosaur_id)
@@ -271,9 +583,10 @@ def _int_metadata(metadata: str, key: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _parse_exercises(text: str) -> tuple[str, float | None]:
+def _parse_exercises(text: str) -> tuple[str, float | None, tuple[LiftosaurExercise, ...]]:
     exercise_lines = _exercise_lines(text)
     summary_lines: list[str] = []
+    exercises: list[LiftosaurExercise] = []
     total_kg = 0.0
     saw_weighted_work = False
     tonnage_safe = True
@@ -297,6 +610,14 @@ def _parse_exercises(text: str) -> tuple[str, float | None]:
             summary_lines.append("Work: " + _format_sets(work_sets_positive))
         if missed_sets:
             summary_lines.append("Missed: " + _format_sets(missed_sets))
+        exercises.append(
+            LiftosaurExercise(
+                exercise_name,
+                work_sets=tuple(_expand_set_groups(work_sets_positive)),
+                warmup_sets=tuple(_expand_set_groups(warmup_sets)),
+                missed_sets=tuple(_expand_set_groups(missed_sets)),
+            )
+        )
         if not work_sets and work_text:
             summary_lines.append("Work: " + work_text)
             tonnage_safe = False
@@ -314,7 +635,15 @@ def _parse_exercises(text: str) -> tuple[str, float | None]:
         summary_lines.append("")
     summary = "\n".join(summary_lines).strip()
     kg_lifted = total_kg if saw_weighted_work and tonnage_safe else None
-    return summary, kg_lifted
+    return summary, kg_lifted, tuple(exercises)
+
+
+def _expand_set_groups(groups: list[tuple[int, int, float | None, str | None]]) -> list[LiftosaurSet]:
+    sets: list[LiftosaurSet] = []
+    for count, repetitions, weight, unit in groups:
+        for _ in range(count):
+            sets.append(LiftosaurSet(repetitions, weight, unit))
+    return sets
 
 
 def _exercise_lines(text: str) -> list[str]:
@@ -427,14 +756,43 @@ def _overlapping_workout_ids(workouts: list[LiftosaurWorkout]) -> set[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Plan a Liftosaur to Intervals.icu sync")
+    parser = argparse.ArgumentParser(description="Sync Liftosaur workout history to supported targets")
+    subparsers = parser.add_subparsers(dest="command")
+    intervals_parser = subparsers.add_parser("intervals", help="Sync Liftosaur Workouts to Intervals Activities")
+    _add_sync_arguments(intervals_parser)
+    strava_parser = subparsers.add_parser("strava", help="Upload structured Strava Activities")
+    _add_sync_arguments(strava_parser)
+    all_parser = subparsers.add_parser("all", help="Run Intervals sync and Strava structured uploads")
+    _add_sync_arguments(all_parser)
+    auth_parser = subparsers.add_parser("strava-auth", help="Authorize Strava and save STRAVA_REFRESH_TOKEN")
+    auth_parser.add_argument("--strava-redirect-uri", help="OAuth redirect URI configured for the Strava app")
+    args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help()
+        return 2
+    load_dotenv()
+    if args.command == "strava-auth":
+        authorize_strava_interactively(args.strava_redirect_uri)
+        print("Saved STRAVA_REFRESH_TOKEN to .env")
+        return 0
+    if args.command == "intervals":
+        return run_intervals_command(args)
+    if args.command == "strava":
+        return run_strava_command(args)
+    if args.command == "all":
+        return run_all_command(args)
+    raise SystemExit(f"Unknown command: {args.command}")
+
+
+def _add_sync_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--since")
     parser.add_argument("--until")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--apply", action="store_true", help="Write planned enrichments and Manual Fallback Activities")
-    args = parser.parse_args(argv)
-    load_dotenv()
+    parser.add_argument("--apply", action="store_true", help="Write planned changes")
+
+
+def run_intervals_command(args: argparse.Namespace) -> int:
     timezone_name = require_env("SYNC_TIMEZONE")
     zone = ZoneInfo(timezone_name)
     since, until = _date_range(args, zone)
@@ -454,6 +812,67 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if any(outcome.status == "failed" for outcome in outcomes) else 0
 
 
+def run_strava_command(args: argparse.Namespace) -> int:
+    timezone_name = require_env("SYNC_TIMEZONE")
+    zone = ZoneInfo(timezone_name)
+    since, until = _date_range(args, zone)
+    liftosaur_records = fetch_liftosaur_history(since, until)
+    workouts = [parse_liftosaur_workout(record["id"], record["text"]) for record in liftosaur_records]
+    intervals_adapter = HttpIntervalsAdapter(require_env("INTERVALS_API_KEY"), require_env("INTERVALS_ATHLETE_ID"), timezone_name)
+    intervals_activities = intervals_adapter.list_activities(since, until)
+    strava_adapter = HttpStravaAdapter(get_strava_access_token(), timezone_name)
+    strava_activities = strava_adapter.list_activities(since, until)
+    hr_streams = fetch_hr_streams_for_strava(workouts, intervals_activities, intervals_adapter)
+    plan = plan_strava_sync(workouts, intervals_activities, strava_activities, hr_streams, timezone_name)
+    outcomes: list[StravaWriteOutcome] = []
+    if args.apply:
+        outcomes = apply_strava_sync_plan(plan, workouts, intervals_activities, hr_streams, strava_adapter, timezone_name)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    if args.json:
+        print(json.dumps(_strava_plan_to_json(plan, generated_at, outcomes), indent=2, sort_keys=True))
+    else:
+        print_strava_plan(plan, generated_at, outcomes)
+    return 1 if any(outcome.status == "failed" for outcome in outcomes) else 0
+
+
+def run_all_command(args: argparse.Namespace) -> int:
+    timezone_name = require_env("SYNC_TIMEZONE")
+    zone = ZoneInfo(timezone_name)
+    since, until = _date_range(args, zone)
+    liftosaur_records = fetch_liftosaur_history(since, until)
+    workouts = [parse_liftosaur_workout(record["id"], record["text"]) for record in liftosaur_records]
+    intervals_adapter = HttpIntervalsAdapter(require_env("INTERVALS_API_KEY"), require_env("INTERVALS_ATHLETE_ID"), timezone_name)
+    intervals_activities = intervals_adapter.list_activities(since, until)
+    strava_adapter = HttpStravaAdapter(get_strava_access_token(), timezone_name)
+    strava_activities = strava_adapter.list_activities(since, until)
+    hr_streams = fetch_hr_streams_for_strava(workouts, intervals_activities, intervals_adapter)
+    intervals_plan = plan_sync(workouts, intervals_activities, PlanningOptions())
+    strava_plan = plan_strava_sync(workouts, intervals_activities, strava_activities, hr_streams, timezone_name)
+    intervals_outcomes: list[WriteOutcome] = []
+    strava_outcomes: list[StravaWriteOutcome] = []
+    if args.apply:
+        intervals_outcomes = apply_sync_plan(intervals_plan, workouts, intervals_adapter)
+        strava_outcomes = apply_strava_sync_plan(strava_plan, workouts, intervals_activities, hr_streams, strava_adapter, timezone_name)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "intervals": _plan_to_json(intervals_plan, generated_at, workouts, intervals_activities, intervals_outcomes),
+                    "strava": _strava_plan_to_json(strava_plan, generated_at, strava_outcomes),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        print("Intervals")
+        print_plan(intervals_plan, workouts, intervals_activities, generated_at, intervals_outcomes)
+        print("\nStrava")
+        print_strava_plan(strava_plan, generated_at, strava_outcomes)
+    return 1 if any(outcome.status == "failed" for outcome in intervals_outcomes + strava_outcomes) else 0
+
+
 def load_dotenv(path: str = ".env") -> None:
     if not os.path.exists(path):
         return
@@ -471,6 +890,129 @@ def require_env(name: str) -> str:
     if not value:
         raise SystemExit(f"Missing required environment variable: {name}")
     return value
+
+
+def authorize_strava_interactively(redirect_uri: str | None = None, env_path: str = ".env") -> StravaTokens:
+    client_id = require_env("STRAVA_CLIENT_ID")
+    client_secret = require_env("STRAVA_CLIENT_SECRET")
+    redirect_uri = redirect_uri or os.environ.get("STRAVA_REDIRECT_URI") or STRAVA_DEFAULT_REDIRECT_URI
+    url = build_strava_authorize_url(client_id, redirect_uri)
+    print("Open this Strava authorization URL:")
+    print(url)
+    webbrowser.open(url)
+    redirected = input("Paste the full redirected URL, or just the code parameter: ").strip()
+    code = extract_strava_code(redirected)
+    tokens = exchange_strava_code(client_id, client_secret, code)
+    persist_env_value(env_path, "STRAVA_REFRESH_TOKEN", tokens.refresh_token)
+    if redirect_uri != STRAVA_DEFAULT_REDIRECT_URI:
+        persist_env_value(env_path, "STRAVA_REDIRECT_URI", redirect_uri)
+    os.environ["STRAVA_REFRESH_TOKEN"] = tokens.refresh_token
+    return tokens
+
+
+def get_strava_access_token(env_path: str = ".env", interactive: bool = True) -> str:
+    client_id = require_env("STRAVA_CLIENT_ID")
+    client_secret = require_env("STRAVA_CLIENT_SECRET")
+    refresh_token = os.environ.get("STRAVA_REFRESH_TOKEN")
+    if not refresh_token:
+        if not interactive:
+            raise SystemExit("Missing required environment variable: STRAVA_REFRESH_TOKEN")
+        return authorize_strava_interactively(env_path=env_path).access_token
+    tokens = refresh_strava_access_token(client_id, client_secret, refresh_token)
+    if tokens.refresh_token != refresh_token:
+        persist_env_value(env_path, "STRAVA_REFRESH_TOKEN", tokens.refresh_token)
+        os.environ["STRAVA_REFRESH_TOKEN"] = tokens.refresh_token
+    return tokens.access_token
+
+
+def build_strava_authorize_url(client_id: str, redirect_uri: str, scopes: tuple[str, ...] = STRAVA_SCOPES) -> str:
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "approval_prompt": "auto",
+        "scope": ",".join(scopes),
+    }
+    return STRAVA_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
+
+
+def extract_strava_code(value: str) -> str:
+    if not value:
+        raise ValueError("Strava OAuth response is empty")
+    parsed = urllib.parse.urlparse(value)
+    if parsed.query:
+        params = urllib.parse.parse_qs(parsed.query)
+        if params.get("error"):
+            raise ValueError(f"Strava OAuth failed: {params['error'][0]}")
+        codes = params.get("code")
+        if codes and codes[0]:
+            return codes[0]
+    return value
+
+
+def exchange_strava_code(client_id: str, client_secret: str, code: str) -> StravaTokens:
+    payload = _http_form_json(
+        "POST",
+        STRAVA_TOKEN_URL,
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+        },
+    )
+    return _strava_tokens_from_payload(payload)
+
+
+def refresh_strava_access_token(client_id: str, client_secret: str, refresh_token: str) -> StravaTokens:
+    payload = _http_form_json(
+        "POST",
+        STRAVA_TOKEN_URL,
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+    )
+    return _strava_tokens_from_payload(payload)
+
+
+def _strava_tokens_from_payload(payload: object) -> StravaTokens:
+    if not isinstance(payload, dict):
+        raise RuntimeError("Strava token response was not an object")
+    access_token = payload.get("access_token")
+    refresh_token = payload.get("refresh_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise RuntimeError("Strava token response did not include access_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise RuntimeError("Strava token response did not include refresh_token")
+    expires_at = payload.get("expires_at")
+    return StravaTokens(access_token, refresh_token, int(expires_at) if expires_at is not None else None)
+
+
+def persist_env_value(path: str, key: str, value: str) -> None:
+    line = f"{key}={value}\n"
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as file:
+            lines = file.readlines()
+    else:
+        lines = []
+    replaced = False
+    next_lines: list[str] = []
+    for existing in lines:
+        stripped = existing.strip()
+        if stripped and not stripped.startswith("#") and stripped.split("=", 1)[0].strip() == key:
+            next_lines.append(line)
+            replaced = True
+        else:
+            next_lines.append(existing)
+    if not replaced:
+        if next_lines and not next_lines[-1].endswith("\n"):
+            next_lines[-1] += "\n"
+        next_lines.append(line)
+    with open(path, "w", encoding="utf-8") as file:
+        file.writelines(next_lines)
 
 
 def _date_range(args: argparse.Namespace, zone: ZoneInfo) -> tuple[date, date]:
@@ -541,6 +1083,61 @@ def apply_sync_plan(
     return outcomes
 
 
+def fetch_hr_streams_for_strava(
+    workouts: list[LiftosaurWorkout],
+    intervals_activities: list[IntervalsActivity],
+    intervals_adapter: IntervalsAdapter,
+) -> dict[str, StravaHRStream]:
+    streams: dict[str, StravaHRStream] = {}
+    candidate_ids = {
+        candidate.activity.id
+        for workout in workouts
+        for activity in intervals_activities
+        if activity.has_heartrate
+        for candidate in [_time_match_candidate(workout, activity, PlanningOptions())]
+        if candidate is not None
+    }
+    for activity_id in candidate_ids:
+        stream = intervals_adapter.fetch_hr_stream(activity_id)
+        if stream is not None and stream.time and stream.heartrate:
+            streams[activity_id] = stream
+    return streams
+
+
+def apply_strava_sync_plan(
+    plan: StravaSyncPlan,
+    workouts: list[LiftosaurWorkout],
+    intervals_activities: list[IntervalsActivity],
+    hr_streams_by_intervals_id: dict[str, StravaHRStream],
+    strava_adapter: HttpStravaAdapter,
+    timezone_name: str,
+) -> list[StravaWriteOutcome]:
+    workouts_by_id = {workout.id: workout for workout in workouts}
+    intervals_by_id = {activity.id: activity for activity in intervals_activities}
+    outcomes: list[StravaWriteOutcome] = []
+    for action in plan.actions:
+        try:
+            if action.kind == "upload":
+                workout = workouts_by_id[action.liftosaur_id]
+                intervals_activity = intervals_by_id[action.intervals_id or ""]
+                hr_stream = hr_streams_by_intervals_id[action.intervals_id or ""]
+                payload, _warnings = build_strava_upload_payload(workout, intervals_activity, hr_stream, timezone_name)
+                strava_id = strava_adapter.upload_structured_activity(payload)
+                outcomes.append(StravaWriteOutcome(workout.id, "uploaded", strava_id=strava_id))
+            elif action.kind == "skip":
+                outcomes.append(StravaWriteOutcome(action.liftosaur_id, "skipped", strava_id=action.strava_id, reason=action.reason))
+        except Exception as error:
+            outcomes.append(
+                StravaWriteOutcome(
+                    action.liftosaur_id,
+                    "failed",
+                    reason="strava_upload_failed",
+                    detail=str(error),
+                )
+            )
+    return outcomes
+
+
 class IntervalsAdapter:
     timezone_name: str
     activities: list[IntervalsActivity]
@@ -552,6 +1149,9 @@ class IntervalsAdapter:
         raise NotImplementedError
 
     def upsert_manual_activity(self, activity: dict[str, object]) -> str:
+        raise NotImplementedError
+
+    def fetch_hr_stream(self, activity_id: str) -> StravaHRStream | None:
         raise NotImplementedError
 
 
@@ -613,6 +1213,15 @@ class HttpIntervalsAdapter(IntervalsAdapter):
         if not isinstance(created, list) or not created or not isinstance(created[0], dict) or not created[0].get("id"):
             raise RuntimeError("Intervals manual fallback upsert returned no activity id")
         return str(created[0]["id"])
+
+    def fetch_hr_stream(self, activity_id: str) -> StravaHRStream | None:
+        query = urllib.parse.urlencode([("types", "time"), ("types", "heartrate")])
+        payload = _http_json(
+            "GET",
+            f"https://intervals.icu/api/v1/activity/{urllib.parse.quote(activity_id)}/streams.json?{query}",
+            headers={"Authorization": self.auth},
+        )
+        return _parse_intervals_hr_stream(payload)
 
     def _activity_from_item(self, item: dict[str, object]) -> IntervalsActivity:
         start = _parse_intervals_start(item, self.zone)
@@ -691,6 +1300,81 @@ class InMemoryIntervalsAdapter(IntervalsAdapter):
         )
         return activity_id
 
+    def fetch_hr_stream(self, activity_id: str) -> StravaHRStream | None:
+        return None
+
+
+class HttpStravaAdapter:
+    def __init__(self, access_token: str, timezone_name: str):
+        self.access_token = access_token
+        self.timezone_name = timezone_name
+        self.zone = ZoneInfo(timezone_name)
+        self.activities: list[StravaActivity] = []
+
+    def list_activities(self, since: date, until: date) -> list[StravaActivity]:
+        after = int(datetime.combine(since - timedelta(days=1), datetime.min.time(), self.zone).timestamp())
+        before = int(datetime.combine(until + timedelta(days=1), datetime.min.time(), self.zone).timestamp())
+        activities: list[StravaActivity] = []
+        page = 1
+        while True:
+            params = urllib.parse.urlencode({"after": after, "before": before, "page": page, "per_page": 200})
+            payload = _http_json(
+                "GET",
+                f"https://www.strava.com/api/v3/athlete/activities?{params}",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+            )
+            if not isinstance(payload, list) or not payload:
+                break
+            activities.extend(_strava_activity_from_item(item) for item in payload if isinstance(item, dict))
+            if len(payload) < 200:
+                break
+            page += 1
+        self.activities = activities
+        return activities
+
+    def upload_structured_activity(self, payload: dict[str, object]) -> str:
+        file_payload = {
+            key: payload[key]
+            for key in ["version", "start_time", "utc_offset", "elapsed_time", "streams", "sets"]
+            if key in payload
+        }
+        fields = {
+            "sport_type": str(payload.get("sport_type", "WeightTraining")),
+            "name": str(payload["name"]),
+            "description": str(payload["description"]),
+            "data_type": "json",
+            "external_id": str(payload["external_id"]),
+        }
+        upload = _http_multipart_json(
+            "POST",
+            "https://www.strava.com/api/v3/uploads",
+            headers={"Authorization": f"Bearer {self.access_token}"},
+            fields=fields,
+            file_field="file",
+            filename=str(payload["external_id"]) + ".json",
+            file_content=json.dumps(file_payload).encode(),
+            file_content_type="application/json",
+        )
+        if not isinstance(upload, dict) or not upload.get("id"):
+            raise RuntimeError("Strava upload returned no upload id")
+        return self._poll_upload(str(upload["id"]))
+
+    def _poll_upload(self, upload_id: str) -> str:
+        for _ in range(30):
+            time.sleep(1)
+            payload = _http_json(
+                "GET",
+                f"https://www.strava.com/api/v3/uploads/{urllib.parse.quote(upload_id)}",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+            )
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("error"):
+                raise RuntimeError(str(payload["error"]))
+            if payload.get("activity_id"):
+                return str(payload["activity_id"])
+        raise RuntimeError(f"Strava upload {upload_id} did not finish processing")
+
 
 def build_enrich_update(workout: LiftosaurWorkout, activity: IntervalsActivity) -> dict[str, object]:
     update: dict[str, object] = {
@@ -752,8 +1436,120 @@ def _parse_intervals_start(item: dict[str, object], zone: ZoneInfo) -> datetime:
     raise ValueError(f"Intervals Activity {item.get('id')} has no start time")
 
 
+def _parse_intervals_hr_stream(payload: object) -> StravaHRStream | None:
+    if not isinstance(payload, list):
+        return None
+    time_values: list[int] | None = None
+    hr_values: list[int | None] | None = None
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        stream_type = str(item.get("type") or item.get("name") or "").lower()
+        values = _stream_data_values(item.get("data"))
+        if not values:
+            continue
+        if stream_type in {"time", "timer_time", "secs", "seconds"}:
+            time_values = [int(value) for value in values if value is not None]
+        elif stream_type in {"heartrate", "heart_rate", "hr"}:
+            hr_values = [int(value) if value is not None else None for value in values]
+    if time_values is None or hr_values is None:
+        return None
+    count = min(len(time_values), len(hr_values))
+    return StravaHRStream(time_values[:count], hr_values[:count]) if count else None
+
+
+def _stream_data_values(data: object) -> list[object]:
+    if isinstance(data, list):
+        return list(data)
+    if isinstance(data, dict):
+        keys = list(data.keys())
+        if all(str(key).lstrip("-").isdigit() for key in keys):
+            return [data[key] for key in sorted(keys, key=lambda key: int(str(key)))]
+        return list(data.values())
+    return []
+
+
+def _strava_activity_from_item(item: dict[str, object]) -> StravaActivity:
+    start_value = item.get("start_date")
+    if not isinstance(start_value, str) or not start_value:
+        raise ValueError(f"Strava Activity {item.get('id')} has no start time")
+    duration = item.get("elapsed_time") or item.get("moving_time")
+    return StravaActivity(
+        id=str(item["id"]),
+        name=str(item.get("name")) if item.get("name") is not None else None,
+        sport_type=str(item.get("sport_type") or item.get("type")) if item.get("sport_type") or item.get("type") else None,
+        start=datetime.fromisoformat(start_value.replace("Z", "+00:00")).astimezone(timezone.utc),
+        duration_seconds=int(duration) if duration is not None else None,
+        has_heartrate=bool(item.get("has_heartrate")) if item.get("has_heartrate") is not None else None,
+        external_id=str(item.get("external_id")) if item.get("external_id") is not None else None,
+    )
+
+
 def _http_json(method: str, url: str, headers: dict[str, str], body: object | None = None) -> object:
     return _http_json_with_retry(method, url, headers, body)
+
+
+def _http_form_json(method: str, url: str, body: dict[str, str]) -> object:
+    data = urllib.parse.urlencode(body).encode()
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "liftosaur-sync/1.1.1",
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")
+        raise RuntimeError(f"{method} {url} failed with HTTP {error.code}: {detail}") from error
+
+
+def _http_multipart_json(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    fields: dict[str, str],
+    file_field: str,
+    filename: str,
+    file_content: bytes,
+    file_content_type: str,
+) -> object:
+    boundary = f"liftosaur-sync-{int(time.time() * 1000)}"
+    parts: list[bytes] = []
+    for key, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+        )
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\nContent-Type: {file_content_type}\r\n\r\n'.encode()
+        + file_content
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    request = urllib.request.Request(
+        url,
+        data=b"".join(parts),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "liftosaur-sync/1.1.1",
+            **headers,
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")
+        raise RuntimeError(f"{method} {url} failed with HTTP {error.code}: {detail}") from error
 
 
 def _http_json_with_retry(method: str, url: str, headers: dict[str, str], body: object | None) -> object:
@@ -824,6 +1620,61 @@ def print_plan(
         print(f"warning: {warning}", file=sys.stderr)
 
 
+def print_strava_plan(
+    plan: StravaSyncPlan,
+    generated_at: str,
+    outcomes: list[StravaWriteOutcome] | None = None,
+) -> None:
+    outcomes_by_liftosaur_id = {outcome.liftosaur_id: outcome for outcome in outcomes or []}
+    rows: list[list[str]] = []
+    for action in plan.actions:
+        outcome = outcomes_by_liftosaur_id.get(action.liftosaur_id)
+        if action.kind == "upload":
+            rows.append(
+                [
+                    "upload",
+                    action.liftosaur_id,
+                    action.intervals_id or "",
+                    "",
+                    str(action.mapped_set_count),
+                    outcome.status if outcome else "",
+                    outcome.strava_id if outcome and outcome.strava_id else "",
+                    _strava_outcome_note(outcome),
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    "skip",
+                    action.liftosaur_id,
+                    action.intervals_id or "",
+                    action.strava_id or "",
+                    str(action.mapped_set_count) if action.mapped_set_count else "",
+                    outcome.status if outcome else "",
+                    outcome.strava_id if outcome and outcome.strava_id else "",
+                    action.reason or _strava_outcome_note(outcome),
+                ]
+            )
+    print(f"Generated: {generated_at}")
+    print(
+        tabulate(
+            rows,
+            headers=["Action", "Liftosaur ID", "Intervals HR ID", "Existing Strava ID", "Sets", "Outcome", "Uploaded Strava ID", "Note"],
+            tablefmt="github",
+        )
+    )
+    for warning in plan.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+
+
+def _strava_outcome_note(outcome: StravaWriteOutcome | None) -> str:
+    if outcome is None:
+        return ""
+    if outcome.status == "failed":
+        return f"{outcome.reason}: {outcome.detail}"
+    return outcome.reason or ""
+
+
 def _format_display_time(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S %Z")
 
@@ -874,6 +1725,42 @@ def _plan_to_json(
             for action in plan.actions
         ],
         "warnings": plan.warnings,
+    }
+
+
+def _strava_plan_to_json(
+    plan: StravaSyncPlan,
+    generated_at: str,
+    outcomes: list[StravaWriteOutcome] | None = None,
+) -> dict[str, object]:
+    outcomes_by_liftosaur_id = {outcome.liftosaur_id: outcome for outcome in outcomes or []}
+    return {
+        "generated_at": generated_at,
+        "actions": [
+            {
+                "kind": action.kind,
+                "liftosaur_id": action.liftosaur_id,
+                "intervals_id": action.intervals_id,
+                "strava_id": action.strava_id,
+                "mapped_set_count": action.mapped_set_count,
+                "reason": action.reason,
+                "warnings": list(action.warnings),
+                "outcome": _strava_outcome_to_json(outcomes_by_liftosaur_id.get(action.liftosaur_id)),
+            }
+            for action in plan.actions
+        ],
+        "warnings": plan.warnings,
+    }
+
+
+def _strava_outcome_to_json(outcome: StravaWriteOutcome | None) -> dict[str, object] | None:
+    if outcome is None:
+        return None
+    return {
+        "status": outcome.status,
+        "strava_id": outcome.strava_id,
+        "reason": outcome.reason,
+        "detail": outcome.detail,
     }
 
 
