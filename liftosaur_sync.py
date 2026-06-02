@@ -1669,7 +1669,7 @@ def _http_form_json(method: str, url: str, body: dict[str, str]) -> object:
         headers={
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "liftosaur-sync/1.1.1",
+            "User-Agent": "liftosaur-sync/2.0.0",
         },
         method=method,
     )
@@ -1710,7 +1710,7 @@ def _http_multipart_json(
         headers={
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "liftosaur-sync/1.1.1",
+            "User-Agent": "liftosaur-sync/2.0.0",
             **headers,
         },
         method=method,
@@ -1725,7 +1725,7 @@ def _http_multipart_json(
 
 
 def _http_json_with_retry(method: str, url: str, headers: dict[str, str], body: object | None) -> object:
-    merged_headers = {"Accept": "application/json", "User-Agent": "liftosaur-sync/1.1.1", **headers}
+    merged_headers = {"Accept": "application/json", "User-Agent": "liftosaur-sync/2.0.0", **headers}
     data = json.dumps(body).encode() if body is not None else None
     retryable_statuses = {429, 500, 502, 503, 504}
     for attempt in range(4):
