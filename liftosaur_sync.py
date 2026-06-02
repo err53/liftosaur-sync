@@ -64,6 +64,79 @@ class LiftosaurWorkout:
     exercises: tuple[LiftosaurExercise, ...] = ()
 
 
+class LiftosaurProvenance:
+    def external_id(self, workout_or_id: LiftosaurWorkout | str) -> str:
+        liftosaur_id = self._id(workout_or_id)
+        return f"liftosaur:{liftosaur_id}"
+
+    def matches_external_id(self, value: str | None, workout_or_id: LiftosaurWorkout | str) -> bool:
+        if not value:
+            return False
+        return value.removesuffix(".json") == self.external_id(workout_or_id)
+
+    def replace_intervals_managed_block(self, description: str | None, workout_or_id: LiftosaurWorkout | str, body: str) -> str:
+        liftosaur_id = self._id(workout_or_id)
+        start_marker = MANAGED_START_TEMPLATE.format(id=liftosaur_id)
+        end_marker = MANAGED_END_TEMPLATE.format(id=liftosaur_id)
+        block = f"{start_marker}\n{body}\n{end_marker}"
+        existing = description or ""
+        for pattern in self._managed_block_patterns(liftosaur_id):
+            if pattern.search(existing):
+                return pattern.sub(block, existing)
+        if existing.strip():
+            return existing.rstrip() + "\n\n" + block
+        return block
+
+    def has_intervals_managed_block(self, description: str | None, workout_or_id: LiftosaurWorkout | str) -> bool:
+        liftosaur_id = self._id(workout_or_id)
+        existing = description or ""
+        return any(pattern.search(existing) for pattern in self._managed_block_patterns(liftosaur_id))
+
+    def render_intervals_managed_block(self, workout: LiftosaurWorkout) -> str:
+        title = workout.day_name or workout.program or "Strength Training"
+        lines = [f"Liftosaur: {title}", f"Liftosaur history ID: {workout.id}"]
+        if workout.duration_seconds is not None:
+            lines.append(f"Duration: {workout.duration_seconds}s")
+        if workout.kg_lifted is not None:
+            lines.append(f"kg_lifted: {workout.kg_lifted:.3f}")
+        lines.append("")
+        lines.append(workout.summary)
+        lines.append("")
+        lines.append("Raw Liftosaur data:")
+        lines.append(workout.text)
+        return "\n".join(lines)
+
+    def render_strava_description(self, workout: LiftosaurWorkout, intervals_activity: "IntervalsActivity") -> str:
+        lines = ["Synced from Liftosaur."]
+        if workout.program:
+            lines.append(f"Program: {workout.program}")
+        if workout.day_name:
+            lines.append(f"Day: {workout.day_name}")
+        lines.append(f"Liftosaur history ID: {workout.id}")
+        if workout.kg_lifted is not None:
+            lines.append(f"kg_lifted: {workout.kg_lifted:.3f}")
+        lines.append(f"HR source: Intervals Activity {intervals_activity.id}")
+        return "\n".join(lines)
+
+    def _managed_block_patterns(self, liftosaur_id: str) -> list[re.Pattern[str]]:
+        plain_start = MANAGED_START_TEMPLATE.format(id=liftosaur_id)
+        plain_end = MANAGED_END_TEMPLATE.format(id=liftosaur_id)
+        html_start = f"<!-- liftosaur-sync:start id={liftosaur_id} -->"
+        html_end = f"<!-- liftosaur-sync:end id={liftosaur_id} -->"
+        return [
+            re.compile(re.escape(plain_start) + r".*?" + re.escape(plain_end), flags=re.DOTALL),
+            re.compile(re.escape(html_start) + r".*?" + re.escape(html_end), flags=re.DOTALL),
+        ]
+
+    def _id(self, workout_or_id: LiftosaurWorkout | str) -> str:
+        if isinstance(workout_or_id, LiftosaurWorkout):
+            return workout_or_id.id
+        return str(workout_or_id)
+
+
+PROVENANCE = LiftosaurProvenance()
+
+
 @dataclass(frozen=True)
 class IntervalsActivity:
     id: str
@@ -237,7 +310,7 @@ def plan_sync(
     for workout in workouts:
         if workout.id in actions_by_workout:
             continue
-        description_matches = [activity for activity in activities if has_managed_block(activity.description, workout.id)]
+        description_matches = [activity for activity in activities if PROVENANCE.has_intervals_managed_block(activity.description, workout)]
         if len(description_matches) == 1:
             activity = description_matches[0]
             action_warnings: list[str] = []
@@ -308,10 +381,7 @@ def plan_strava_sync(
     warnings: list[str] = []
     actions: list[StravaSyncAction] = []
     for workout in workouts:
-        expected_external_id = f"liftosaur:{workout.id}"
-        external_matches = [
-            activity for activity in strava_activities if _normalize_strava_external_id(activity.external_id) == expected_external_id
-        ]
+        external_matches = [activity for activity in strava_activities if PROVENANCE.matches_external_id(activity.external_id, workout)]
         if external_matches:
             if len(external_matches) > 1:
                 warnings.append(f"Liftosaur Workout {workout.id} has multiple Strava external ID matches")
@@ -418,19 +488,13 @@ class StructuredStravaUploadPolicy:
             "utc_offset": _utc_offset_seconds(workout.start, self.timezone_name),
             "elapsed_time": workout.duration_seconds,
             "name": _strava_upload_name(workout),
-            "description": _strava_upload_description(workout, intervals_activity),
-            "external_id": f"liftosaur:{workout.id}",
+            "description": PROVENANCE.render_strava_description(workout, intervals_activity),
+            "external_id": PROVENANCE.external_id(workout),
             "sport_type": "WeightTraining",
             "streams": stream,
             "sets": sets,
         }
         return payload, warnings
-
-
-def _normalize_strava_external_id(value: str | None) -> str | None:
-    if not value:
-        return None
-    return value.removesuffix(".json")
 
 
 def _unmapped_work_exercise_names(workout: LiftosaurWorkout) -> list[str]:
@@ -501,19 +565,6 @@ def _strava_upload_name(workout: LiftosaurWorkout) -> str:
     return workout.program or workout.day_name or "Strength Training"
 
 
-def _strava_upload_description(workout: LiftosaurWorkout, intervals_activity: IntervalsActivity) -> str:
-    lines = ["Synced from Liftosaur."]
-    if workout.program:
-        lines.append(f"Program: {workout.program}")
-    if workout.day_name:
-        lines.append(f"Day: {workout.day_name}")
-    lines.append(f"Liftosaur history ID: {workout.id}")
-    if workout.kg_lifted is not None:
-        lines.append(f"kg_lifted: {workout.kg_lifted:.3f}")
-    lines.append(f"HR source: Intervals Activity {intervals_activity.id}")
-    return "\n".join(lines)
-
-
 def _isoformat_z(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -524,47 +575,19 @@ def _utc_offset_seconds(value: datetime, timezone_name: str) -> int:
 
 
 def replace_managed_block(description: str | None, liftosaur_id: str, body: str) -> str:
-    start_marker = MANAGED_START_TEMPLATE.format(id=liftosaur_id)
-    end_marker = MANAGED_END_TEMPLATE.format(id=liftosaur_id)
-    block = f"{start_marker}\n{body}\n{end_marker}"
-    existing = description or ""
-    for pattern in _managed_block_patterns(liftosaur_id):
-        if pattern.search(existing):
-            return pattern.sub(block, existing)
-    if existing.strip():
-        return existing.rstrip() + "\n\n" + block
-    return block
+    return PROVENANCE.replace_intervals_managed_block(description, liftosaur_id, body)
 
 
 def has_managed_block(description: str | None, liftosaur_id: str) -> bool:
-    existing = description or ""
-    return any(pattern.search(existing) for pattern in _managed_block_patterns(liftosaur_id))
+    return PROVENANCE.has_intervals_managed_block(description, liftosaur_id)
 
 
 def _managed_block_patterns(liftosaur_id: str) -> list[re.Pattern[str]]:
-    plain_start = MANAGED_START_TEMPLATE.format(id=liftosaur_id)
-    plain_end = MANAGED_END_TEMPLATE.format(id=liftosaur_id)
-    html_start = f"<!-- liftosaur-sync:start id={liftosaur_id} -->"
-    html_end = f"<!-- liftosaur-sync:end id={liftosaur_id} -->"
-    return [
-        re.compile(re.escape(plain_start) + r".*?" + re.escape(plain_end), flags=re.DOTALL),
-        re.compile(re.escape(html_start) + r".*?" + re.escape(html_end), flags=re.DOTALL),
-    ]
+    return PROVENANCE._managed_block_patterns(liftosaur_id)
 
 
 def render_managed_block(workout: LiftosaurWorkout) -> str:
-    title = workout.day_name or workout.program or "Strength Training"
-    lines = [f"Liftosaur: {title}", f"Liftosaur history ID: {workout.id}"]
-    if workout.duration_seconds is not None:
-        lines.append(f"Duration: {workout.duration_seconds}s")
-    if workout.kg_lifted is not None:
-        lines.append(f"kg_lifted: {workout.kg_lifted:.3f}")
-    lines.append("")
-    lines.append(workout.summary)
-    lines.append("")
-    lines.append("Raw Liftosaur data:")
-    lines.append(workout.text)
-    return "\n".join(lines)
+    return PROVENANCE.render_intervals_managed_block(workout)
 
 
 def _quoted_metadata(metadata: str, key: str) -> str | None:
@@ -1475,7 +1498,11 @@ class HttpStravaAdapter:
 
 def build_enrich_update(workout: LiftosaurWorkout, activity: IntervalsActivity) -> dict[str, object]:
     update: dict[str, object] = {
-        "description": replace_managed_block(activity.description, workout.id, render_managed_block(workout)),
+        "description": PROVENANCE.replace_intervals_managed_block(
+            activity.description,
+            workout,
+            PROVENANCE.render_intervals_managed_block(workout),
+        ),
         "tags": _add_tags(activity.tags, ["liftosaur"]),
     }
     if workout.kg_lifted is not None:
@@ -1487,14 +1514,19 @@ def build_fallback_upsert(workout: LiftosaurWorkout, timezone_name: str) -> dict
     if workout.duration_seconds is None:
         raise ValueError(f"Liftosaur Workout {workout.id} has no duration")
     local_start = workout.start.astimezone(ZoneInfo(timezone_name)).replace(tzinfo=None)
+    description = PROVENANCE.replace_intervals_managed_block(
+        "",
+        workout,
+        PROVENANCE.render_intervals_managed_block(workout),
+    )
     body: dict[str, object] = {
         "name": workout.day_name or workout.program or "Strength Training",
-        "description": replace_managed_block("", workout.id, render_managed_block(workout)),
+        "description": description,
         "type": "WeightTraining",
         "start_date_local": local_start.isoformat(timespec="seconds"),
         "elapsed_time": workout.duration_seconds,
         "moving_time": workout.duration_seconds,
-        "external_id": f"liftosaur:{workout.id}",
+        "external_id": PROVENANCE.external_id(workout),
     }
     if workout.kg_lifted is not None:
         body["kg_lifted"] = workout.kg_lifted
@@ -1504,8 +1536,13 @@ def build_fallback_upsert(workout: LiftosaurWorkout, timezone_name: str) -> dict
 def build_fallback_update(workout: LiftosaurWorkout, action: SyncAction) -> dict[str, object]:
     if workout.duration_seconds is None:
         raise ValueError(f"Liftosaur Workout {workout.id} has no duration")
+    description = PROVENANCE.replace_intervals_managed_block(
+        "",
+        workout,
+        PROVENANCE.render_intervals_managed_block(workout),
+    )
     update: dict[str, object] = {
-        "description": replace_managed_block("", workout.id, render_managed_block(workout)),
+        "description": description,
         "tags": ["liftosaur", "liftosaur-fallback"],
         "elapsed_time": workout.duration_seconds,
         "moving_time": workout.duration_seconds,
@@ -1702,7 +1739,7 @@ def print_plan(
             rows.append(["enrich", action.liftosaur_id, workout_start, kg_lifted, action.intervals_id or "", activity_start, action.match_kind or "", hr, outcome_text, _outcome_note(outcome)])
         elif action.kind == "fallback":
             intervals_id = outcome.intervals_id if outcome and outcome.intervals_id else ""
-            rows.append(["fallback", action.liftosaur_id, workout_start, kg_lifted, intervals_id, "", "", "", outcome_text, f"external_id=liftosaur:{action.liftosaur_id}"])
+            rows.append(["fallback", action.liftosaur_id, workout_start, kg_lifted, intervals_id, "", "", "", outcome_text, f"external_id={PROVENANCE.external_id(action.liftosaur_id)}"])
         else:
             rows.append(["skip", action.liftosaur_id, workout_start, kg_lifted, "", "", "", "", outcome_text, action.reason or ""])
     print(f"Generated: {generated_at}")
