@@ -1130,37 +1130,69 @@ def apply_sync_plan(
     workouts: list[LiftosaurWorkout],
     intervals_adapter: "IntervalsAdapter",
 ) -> list[WriteOutcome]:
-    workouts_by_id = {workout.id: workout for workout in workouts}
-    activities_by_id = {activity.id: activity for activity in intervals_adapter.activities}
-    outcomes: list[WriteOutcome] = []
-    for action in plan.actions:
-        try:
-            if action.kind == "enrich":
-                workout = workouts_by_id[action.liftosaur_id]
-                activity = activities_by_id[action.intervals_id or ""]
-                update = build_enrich_update(workout, activity)
-                intervals_adapter.update_activity(activity.id, update)
-                outcomes.append(WriteOutcome(workout.id, "enriched", intervals_id=activity.id))
-            elif action.kind == "fallback":
-                workout = workouts_by_id[action.liftosaur_id]
-                upsert = build_fallback_upsert(workout, intervals_adapter.timezone_name)
-                intervals_id = intervals_adapter.upsert_manual_activity(upsert)
-                update = build_fallback_update(workout, SyncAction("fallback", workout.id, intervals_id=intervals_id))
-                intervals_adapter.update_activity(intervals_id, update)
-                outcomes.append(WriteOutcome(workout.id, "fallback_upserted", intervals_id=intervals_id))
-            elif action.kind == "skip":
-                outcomes.append(WriteOutcome(action.liftosaur_id, "skipped", reason=action.reason))
-        except Exception as error:
-            outcomes.append(
-                WriteOutcome(
-                    action.liftosaur_id,
-                    "failed",
-                    intervals_id=action.intervals_id,
-                    reason="activity_update_failed",
-                    detail=str(error),
+    return IntervalsWriteWorkflow(intervals_adapter).apply(plan, workouts)
+
+
+class IntervalsWriteWorkflow:
+    def __init__(self, intervals_adapter: "IntervalsAdapter"):
+        self.intervals_adapter = intervals_adapter
+
+    def apply(self, plan: SyncPlan, workouts: list[LiftosaurWorkout]) -> list[WriteOutcome]:
+        workouts_by_id = {workout.id: workout for workout in workouts}
+        activities_by_id = {activity.id: activity for activity in self.intervals_adapter.activities}
+        outcomes: list[WriteOutcome] = []
+        for action in plan.actions:
+            try:
+                outcomes.append(self._apply_action(action, workouts_by_id, activities_by_id))
+            except Exception as error:
+                outcomes.append(
+                    WriteOutcome(
+                        action.liftosaur_id,
+                        "failed",
+                        intervals_id=action.intervals_id,
+                        reason="activity_update_failed",
+                        detail=str(error),
+                    )
                 )
-            )
-    return outcomes
+        return outcomes
+
+    def _apply_action(
+        self,
+        action: SyncAction,
+        workouts_by_id: dict[str, LiftosaurWorkout],
+        activities_by_id: dict[str, IntervalsActivity],
+    ) -> WriteOutcome:
+        if action.kind == "enrich":
+            return self._enrich(action, workouts_by_id, activities_by_id)
+        if action.kind == "fallback":
+            return self._upsert_manual_fallback(action, workouts_by_id)
+        if action.kind == "skip":
+            return WriteOutcome(action.liftosaur_id, "skipped", reason=action.reason)
+        raise ValueError(f"Unknown sync action kind: {action.kind}")
+
+    def _enrich(
+        self,
+        action: SyncAction,
+        workouts_by_id: dict[str, LiftosaurWorkout],
+        activities_by_id: dict[str, IntervalsActivity],
+    ) -> WriteOutcome:
+        workout = workouts_by_id[action.liftosaur_id]
+        activity = activities_by_id[action.intervals_id or ""]
+        update = build_enrich_update(workout, activity)
+        self.intervals_adapter.update_activity(activity.id, update)
+        return WriteOutcome(workout.id, "enriched", intervals_id=activity.id)
+
+    def _upsert_manual_fallback(
+        self,
+        action: SyncAction,
+        workouts_by_id: dict[str, LiftosaurWorkout],
+    ) -> WriteOutcome:
+        workout = workouts_by_id[action.liftosaur_id]
+        upsert = build_fallback_upsert(workout, self.intervals_adapter.timezone_name)
+        intervals_id = self.intervals_adapter.upsert_manual_activity(upsert)
+        update = build_fallback_update(workout, SyncAction("fallback", workout.id, intervals_id=intervals_id))
+        self.intervals_adapter.update_activity(intervals_id, update)
+        return WriteOutcome(workout.id, "fallback_upserted", intervals_id=intervals_id)
 
 
 def fetch_hr_streams_for_strava(
