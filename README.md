@@ -16,12 +16,20 @@ STRAVA_CLIENT_SECRET=
 STRAVA_REFRESH_TOKEN=
 ```
 
+Load `.env` through uv when running commands:
+
+```sh
+export UV_ENV_FILE=.env
+```
+
+You can also pass `--env-file .env` to each `uv run` command instead.
+
 `INTERVALS_ATHLETE_ID` must be the real athlete ID, not `i`, when using API-key auth.
 
 For first-run Strava authorization, set `STRAVA_CLIENT_ID` and `STRAVA_CLIENT_SECRET`, then run:
 
 ```sh
-uv run liftosaur-sync strava-auth
+UV_ENV_FILE=.env uv run liftosaur-sync strava-auth
 ```
 
 Authorize the app with `activity:read_all` and `activity:write`, then paste the redirected URL or `code` value when prompted. The command saves `STRAVA_REFRESH_TOKEN` to `.env`.

@@ -17,7 +17,6 @@ from liftosaur_sync.auth import (
     build_strava_authorize_url,
     extract_strava_code,
     get_strava_access_token,
-    load_dotenv,
     persist_env_value,
     require_env,
 )
@@ -636,7 +635,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 2
-    load_dotenv()
     if args.command == "strava-auth":
         authorize_strava_interactively(args.strava_redirect_uri)
         print("Saved STRAVA_REFRESH_TOKEN to .env")

@@ -14,18 +14,6 @@ STRAVA_DEFAULT_REDIRECT_URI = "http://localhost/exchange_token"
 STRAVA_SCOPES = ("activity:read_all", "activity:write")
 
 
-def load_dotenv(path: str = ".env") -> None:
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as file:
-        for line in file:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or "=" not in stripped:
-                continue
-            key, value = stripped.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
 def require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
