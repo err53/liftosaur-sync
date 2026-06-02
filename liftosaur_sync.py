@@ -96,6 +96,19 @@ class StravaHRStream:
 
 
 @dataclass(frozen=True)
+class StructuredStravaUpload:
+    liftosaur_id: str
+    intervals_id: str
+    payload: dict[str, object]
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def mapped_set_count(self) -> int:
+        sets = self.payload.get("sets", [])
+        return len(sets) if isinstance(sets, list) else 0
+
+
+@dataclass(frozen=True)
 class StravaSyncAction:
     kind: str
     liftosaur_id: str
@@ -104,6 +117,7 @@ class StravaSyncAction:
     reason: str | None = None
     mapped_set_count: int = 0
     warnings: tuple[str, ...] = ()
+    upload: StructuredStravaUpload | None = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +304,7 @@ def plan_strava_sync(
 ) -> StravaSyncPlan:
     options = options or PlanningOptions()
     time_matches = TimeMatchPolicy(options)
+    upload_policy = StructuredStravaUploadPolicy(timezone_name)
     warnings: list[str] = []
     actions: list[StravaSyncAction] = []
     for workout in workouts:
@@ -341,20 +356,22 @@ def plan_strava_sync(
             continue
 
         try:
-            payload, action_warnings = build_strava_upload_payload(workout, intervals_match.activity, hr_stream, timezone_name)
+            upload = upload_policy.build(workout, intervals_match.activity, hr_stream)
         except ValueError as error:
             actions.append(
                 StravaSyncAction("skip", workout.id, intervals_id=intervals_match.activity.id, reason=str(error))
             )
             continue
+        action_warnings = list(upload.warnings)
         warnings.extend(action_warnings)
         actions.append(
             StravaSyncAction(
                 "upload",
                 workout.id,
                 intervals_id=intervals_match.activity.id,
-                mapped_set_count=len(payload["sets"]),
-                warnings=tuple(action_warnings),
+                mapped_set_count=upload.mapped_set_count,
+                warnings=upload.warnings,
+                upload=upload,
             )
         )
     return StravaSyncPlan(actions, warnings)
@@ -366,25 +383,48 @@ def build_strava_upload_payload(
     hr_stream: StravaHRStream,
     timezone_name: str,
 ) -> tuple[dict[str, object], list[str]]:
-    if workout.duration_seconds is None:
-        raise ValueError("missing duration")
-    sets = _strava_sets_for_workout(workout)
-    if not sets:
-        raise ValueError("no mapped work sets")
-    stream, warnings = _align_hr_stream(workout, intervals_activity, hr_stream)
-    payload: dict[str, object] = {
-        "version": "1.0",
-        "start_time": _isoformat_z(workout.start),
-        "utc_offset": _utc_offset_seconds(workout.start, timezone_name),
-        "elapsed_time": workout.duration_seconds,
-        "name": _strava_upload_name(workout),
-        "description": _strava_upload_description(workout, intervals_activity),
-        "external_id": f"liftosaur:{workout.id}",
-        "sport_type": "WeightTraining",
-        "streams": stream,
-        "sets": sets,
-    }
-    return payload, warnings
+    upload = StructuredStravaUploadPolicy(timezone_name).build(workout, intervals_activity, hr_stream)
+    return upload.payload, list(upload.warnings)
+
+
+class StructuredStravaUploadPolicy:
+    def __init__(self, timezone_name: str):
+        self.timezone_name = timezone_name
+
+    def build(
+        self,
+        workout: LiftosaurWorkout,
+        intervals_activity: IntervalsActivity,
+        hr_stream: StravaHRStream,
+    ) -> StructuredStravaUpload:
+        payload, warnings = self._payload(workout, intervals_activity, hr_stream)
+        return StructuredStravaUpload(workout.id, intervals_activity.id, payload, tuple(warnings))
+
+    def _payload(
+        self,
+        workout: LiftosaurWorkout,
+        intervals_activity: IntervalsActivity,
+        hr_stream: StravaHRStream,
+    ) -> tuple[dict[str, object], list[str]]:
+        if workout.duration_seconds is None:
+            raise ValueError("missing duration")
+        sets = _strava_sets_for_workout(workout)
+        if not sets:
+            raise ValueError("no mapped work sets")
+        stream, warnings = _align_hr_stream(workout, intervals_activity, hr_stream)
+        payload: dict[str, object] = {
+            "version": "1.0",
+            "start_time": _isoformat_z(workout.start),
+            "utc_offset": _utc_offset_seconds(workout.start, self.timezone_name),
+            "elapsed_time": workout.duration_seconds,
+            "name": _strava_upload_name(workout),
+            "description": _strava_upload_description(workout, intervals_activity),
+            "external_id": f"liftosaur:{workout.id}",
+            "sport_type": "WeightTraining",
+            "streams": stream,
+            "sets": sets,
+        }
+        return payload, warnings
 
 
 def _normalize_strava_external_id(value: str | None) -> str | None:
@@ -866,7 +906,7 @@ def run_strava_command(args: argparse.Namespace) -> int:
     plan = plan_strava_sync(workouts, intervals_activities, strava_activities, hr_streams, timezone_name)
     outcomes: list[StravaWriteOutcome] = []
     if args.apply:
-        outcomes = apply_strava_sync_plan(plan, workouts, intervals_activities, hr_streams, strava_adapter, timezone_name)
+        outcomes = apply_strava_sync_plan(plan, strava_adapter)
     generated_at = datetime.now(timezone.utc).isoformat()
     if args.json:
         print(json.dumps(_strava_plan_to_json(plan, generated_at, outcomes), indent=2, sort_keys=True))
@@ -892,7 +932,7 @@ def run_all_command(args: argparse.Namespace) -> int:
     strava_outcomes: list[StravaWriteOutcome] = []
     if args.apply:
         intervals_outcomes = apply_sync_plan(intervals_plan, workouts, intervals_adapter)
-        strava_outcomes = apply_strava_sync_plan(strava_plan, workouts, intervals_activities, hr_streams, strava_adapter, timezone_name)
+        strava_outcomes = apply_strava_sync_plan(strava_plan, strava_adapter)
     generated_at = datetime.now(timezone.utc).isoformat()
     if args.json:
         print(
@@ -1139,24 +1179,16 @@ def fetch_hr_streams_for_strava(
 
 def apply_strava_sync_plan(
     plan: StravaSyncPlan,
-    workouts: list[LiftosaurWorkout],
-    intervals_activities: list[IntervalsActivity],
-    hr_streams_by_intervals_id: dict[str, StravaHRStream],
     strava_adapter: HttpStravaAdapter,
-    timezone_name: str,
 ) -> list[StravaWriteOutcome]:
-    workouts_by_id = {workout.id: workout for workout in workouts}
-    intervals_by_id = {activity.id: activity for activity in intervals_activities}
     outcomes: list[StravaWriteOutcome] = []
     for action in plan.actions:
         try:
             if action.kind == "upload":
-                workout = workouts_by_id[action.liftosaur_id]
-                intervals_activity = intervals_by_id[action.intervals_id or ""]
-                hr_stream = hr_streams_by_intervals_id[action.intervals_id or ""]
-                payload, _warnings = build_strava_upload_payload(workout, intervals_activity, hr_stream, timezone_name)
-                strava_id = strava_adapter.upload_structured_activity(payload)
-                outcomes.append(StravaWriteOutcome(workout.id, "uploaded", strava_id=strava_id))
+                if action.upload is None:
+                    raise RuntimeError("missing Structured Strava Upload intent")
+                strava_id = strava_adapter.upload_structured_activity(action.upload.payload)
+                outcomes.append(StravaWriteOutcome(action.liftosaur_id, "uploaded", strava_id=strava_id))
             elif action.kind == "skip":
                 outcomes.append(StravaWriteOutcome(action.liftosaur_id, "skipped", strava_id=action.strava_id, reason=action.reason))
         except Exception as error:
