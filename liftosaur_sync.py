@@ -156,9 +156,16 @@ class StravaWriteOutcome:
 
 @dataclass(frozen=True)
 class MatchCandidate:
-    activity: IntervalsActivity
+    activity: object
     overlap_seconds: int
     start_delta_seconds: float
+
+
+@dataclass(frozen=True)
+class IntervalsTimeMatchIndex:
+    candidates_by_workout: dict[str, list[MatchCandidate]]
+    ambiguous_workout_ids: set[str]
+    warnings: list[str]
 
 
 @dataclass(frozen=True)
@@ -204,10 +211,11 @@ def plan_sync(
     activities: list[IntervalsActivity],
     options: PlanningOptions,
 ) -> SyncPlan:
+    time_matches = TimeMatchPolicy(options)
     warnings: list[str] = []
     actions_by_workout: dict[str, SyncAction] = {}
 
-    overlapping_workouts = _overlapping_workout_ids(workouts)
+    overlapping_workouts = time_matches.overlapping_workout_ids(workouts)
     for workout_id in sorted(overlapping_workouts):
         warnings.append(f"Liftosaur Workout {workout_id} overlaps another Liftosaur Workout; skipping")
         actions_by_workout[workout_id] = SyncAction("skip", workout_id, reason="overlapping Liftosaur Workouts")
@@ -230,50 +238,25 @@ def plan_sync(
             warnings.append(f"Liftosaur Workout {workout.id} has managed blocks on multiple Intervals Activities; skipping")
             actions_by_workout[workout.id] = SyncAction("skip", workout.id, reason="multiple managed blocks")
 
-    candidates_by_workout: dict[str, list[MatchCandidate]] = {}
-    matched_workouts_by_activity: dict[str, list[str]] = {}
+    match_index = time_matches.index_intervals_activities(
+        [workout for workout in workouts if workout.id not in actions_by_workout], activities
+    )
+    warnings.extend(match_index.warnings)
 
     for workout in workouts:
         if workout.id in actions_by_workout:
             continue
-        eligible: list[MatchCandidate] = []
-        for activity in activities:
-            candidate = _time_match_candidate(workout, activity, options)
-            if candidate is None:
-                continue
-            if activity.type in options.eligible_types:
-                eligible.append(candidate)
-            else:
-                warnings.append(
-                    f"Liftosaur Workout {workout.id} has ineligible overlapping Intervals Activity "
-                    f"{activity.id} of type {activity.type}; ignoring"
-                )
-        candidates_by_workout[workout.id] = eligible
-        for candidate in eligible:
-            matched_workouts_by_activity.setdefault(candidate.activity.id, []).append(workout.id)
-
-    ambiguous_workout_ids: set[str] = set()
-    for activity_id, workout_ids in matched_workouts_by_activity.items():
-        if len(workout_ids) > 1:
-            warnings.append(
-                f"Intervals Activity {activity_id} matches multiple Liftosaur Workouts; skipping affected workouts"
-            )
-            ambiguous_workout_ids.update(workout_ids)
-
-    for workout in workouts:
-        if workout.id in actions_by_workout:
-            continue
-        if workout.id in ambiguous_workout_ids:
+        if workout.id in match_index.ambiguous_workout_ids:
             actions_by_workout[workout.id] = SyncAction(
                 "skip", workout.id, reason="one Intervals Activity matches multiple Liftosaur Workouts"
             )
             continue
 
-        candidates = candidates_by_workout.get(workout.id, [])
+        candidates = match_index.candidates_by_workout.get(workout.id, [])
         if candidates:
             if len(candidates) > 1:
                 warnings.append(f"Liftosaur Workout {workout.id} has multiple eligible Time Matches; choosing best candidate")
-            winner = _choose_candidate(candidates)
+            winner = time_matches.choose(candidates)
             if winner is None:
                 warnings.append(f"Liftosaur Workout {workout.id} has tied Time Matches; skipping")
                 actions_by_workout[workout.id] = SyncAction("skip", workout.id, reason="tied Time Matches")
@@ -306,6 +289,7 @@ def plan_strava_sync(
     options: PlanningOptions | None = None,
 ) -> StravaSyncPlan:
     options = options or PlanningOptions()
+    time_matches = TimeMatchPolicy(options)
     warnings: list[str] = []
     actions: list[StravaSyncAction] = []
     for workout in workouts:
@@ -321,11 +305,7 @@ def plan_strava_sync(
             )
             continue
 
-        strava_time_matches = [
-            activity
-            for activity in strava_activities
-            if activity.sport_type in ELIGIBLE_STRAVA_TYPES and _time_matches_activity(workout, activity.start, activity.duration_seconds, options)
-        ]
+        strava_time_matches = time_matches.strava_time_matches(workout, strava_activities)
         if strava_time_matches:
             if len(strava_time_matches) > 1:
                 warnings.append(f"Liftosaur Workout {workout.id} has multiple existing Strava Time Matches")
@@ -334,7 +314,7 @@ def plan_strava_sync(
             )
             continue
 
-        intervals_match = _choose_intervals_hr_source(workout, intervals_activities, options)
+        intervals_match = time_matches.choose_intervals_hr_source(workout, intervals_activities)
         if intervals_match is None:
             actions.append(StravaSyncAction("skip", workout.id, reason="missing Intervals Time Match"))
             continue
@@ -411,32 +391,6 @@ def _normalize_strava_external_id(value: str | None) -> str | None:
     if not value:
         return None
     return value.removesuffix(".json")
-
-
-def _time_matches_activity(
-    workout: LiftosaurWorkout,
-    activity_start: datetime,
-    activity_duration_seconds: int | None,
-    options: PlanningOptions,
-) -> bool:
-    start_delta = abs((workout.start - activity_start).total_seconds())
-    overlap = _overlap_seconds(workout.start, workout.duration_seconds, activity_start, activity_duration_seconds)
-    return overlap >= options.overlap_seconds or start_delta <= options.start_tolerance_seconds
-
-
-def _choose_intervals_hr_source(
-    workout: LiftosaurWorkout,
-    intervals_activities: list[IntervalsActivity],
-    options: PlanningOptions,
-) -> MatchCandidate | None:
-    candidates = [
-        candidate
-        for activity in intervals_activities
-        if activity.type in options.eligible_types and activity.has_heartrate
-        for candidate in [_time_match_candidate(workout, activity, options)]
-        if candidate is not None
-    ]
-    return _choose_candidate(candidates) if candidates else None
 
 
 def _unmapped_work_exercise_names(workout: LiftosaurWorkout) -> list[str]:
@@ -694,16 +648,130 @@ def _format_set(set_: tuple[int, int, float | None, str | None]) -> str:
     return f"{count}x{reps} @ {weight_text} {unit}"
 
 
+class TimeMatchPolicy:
+    def __init__(self, options: PlanningOptions):
+        self.options = options
+
+    def candidate(self, workout: LiftosaurWorkout, activity: object) -> MatchCandidate | None:
+        activity_start = getattr(activity, "start")
+        activity_duration = getattr(activity, "duration_seconds")
+        start_delta = abs((workout.start - activity_start).total_seconds())
+        overlap = _overlap_seconds(workout.start, workout.duration_seconds, activity_start, activity_duration)
+        if overlap >= self.options.overlap_seconds or start_delta <= self.options.start_tolerance_seconds:
+            return MatchCandidate(activity, overlap, start_delta)
+        return None
+
+    def choose(self, candidates: list[MatchCandidate]) -> MatchCandidate | None:
+        ranked = sorted(candidates, key=self._rank_key)
+        if len(ranked) > 1 and self._tie_key(ranked[0]) == self._tie_key(ranked[1]):
+            return None
+        return ranked[0]
+
+    def overlapping_workout_ids(self, workouts: list[LiftosaurWorkout]) -> set[str]:
+        overlapping: set[str] = set()
+        for index, left in enumerate(workouts):
+            for right in workouts[index + 1 :]:
+                if _overlap_seconds(left.start, left.duration_seconds, right.start, right.duration_seconds) > 0:
+                    overlapping.add(left.id)
+                    overlapping.add(right.id)
+        return overlapping
+
+    def index_intervals_activities(
+        self,
+        workouts: list[LiftosaurWorkout],
+        activities: list[IntervalsActivity],
+    ) -> IntervalsTimeMatchIndex:
+        warnings: list[str] = []
+        candidates_by_workout: dict[str, list[MatchCandidate]] = {}
+        matched_workouts_by_activity: dict[str, list[str]] = {}
+        for workout in workouts:
+            eligible: list[MatchCandidate] = []
+            for activity in activities:
+                candidate = self.candidate(workout, activity)
+                if candidate is None:
+                    continue
+                if activity.type in self.options.eligible_types:
+                    eligible.append(candidate)
+                else:
+                    warnings.append(
+                        f"Liftosaur Workout {workout.id} has ineligible overlapping Intervals Activity "
+                        f"{activity.id} of type {activity.type}; ignoring"
+                    )
+            candidates_by_workout[workout.id] = eligible
+            for candidate in eligible:
+                activity = candidate.activity
+                matched_workouts_by_activity.setdefault(getattr(activity, "id"), []).append(workout.id)
+
+        ambiguous_workout_ids: set[str] = set()
+        for activity_id, workout_ids in matched_workouts_by_activity.items():
+            if len(workout_ids) > 1:
+                warnings.append(f"Intervals Activity {activity_id} matches multiple Liftosaur Workouts; skipping affected workouts")
+                ambiguous_workout_ids.update(workout_ids)
+        return IntervalsTimeMatchIndex(candidates_by_workout, ambiguous_workout_ids, warnings)
+
+    def choose_intervals_hr_source(
+        self,
+        workout: LiftosaurWorkout,
+        intervals_activities: list[IntervalsActivity],
+    ) -> MatchCandidate | None:
+        candidates = [
+            candidate
+            for activity in intervals_activities
+            if activity.type in self.options.eligible_types and activity.has_heartrate
+            for candidate in [self.candidate(workout, activity)]
+            if candidate is not None
+        ]
+        return self.choose(candidates) if candidates else None
+
+    def strava_time_matches(
+        self,
+        workout: LiftosaurWorkout,
+        strava_activities: list[StravaActivity],
+    ) -> list[StravaActivity]:
+        return [
+            activity
+            for activity in strava_activities
+            if activity.sport_type in ELIGIBLE_STRAVA_TYPES and self.candidate(workout, activity) is not None
+        ]
+
+    def intervals_hr_source_ids(
+        self,
+        workouts: list[LiftosaurWorkout],
+        intervals_activities: list[IntervalsActivity],
+    ) -> set[str]:
+        return {
+            candidate.activity.id
+            for workout in workouts
+            for activity in intervals_activities
+            if activity.has_heartrate
+            for candidate in [self.candidate(workout, activity)]
+            if candidate is not None
+        }
+
+    def _rank_key(self, candidate: MatchCandidate) -> tuple[int, int, float, str]:
+        activity = candidate.activity
+        return (
+            0 if getattr(activity, "has_heartrate") else 1,
+            -candidate.overlap_seconds,
+            candidate.start_delta_seconds,
+            str(getattr(activity, "id")),
+        )
+
+    def _tie_key(self, candidate: MatchCandidate) -> tuple[int, int, float]:
+        activity = candidate.activity
+        return (
+            0 if getattr(activity, "has_heartrate") else 1,
+            -candidate.overlap_seconds,
+            candidate.start_delta_seconds,
+        )
+
+
 def _time_match_candidate(
     workout: LiftosaurWorkout,
     activity: IntervalsActivity,
     options: PlanningOptions,
 ) -> MatchCandidate | None:
-    start_delta = abs((workout.start - activity.start).total_seconds())
-    overlap = _overlap_seconds(workout.start, workout.duration_seconds, activity.start, activity.duration_seconds)
-    if overlap >= options.overlap_seconds or start_delta <= options.start_tolerance_seconds:
-        return MatchCandidate(activity, overlap, start_delta)
-    return None
+    return TimeMatchPolicy(options).candidate(workout, activity)
 
 
 def _overlap_seconds(
@@ -720,39 +788,11 @@ def _overlap_seconds(
 
 
 def _choose_candidate(candidates: list[MatchCandidate]) -> MatchCandidate | None:
-    ranked = sorted(
-        candidates,
-        key=lambda candidate: (
-            0 if candidate.activity.has_heartrate else 1,
-            -candidate.overlap_seconds,
-            candidate.start_delta_seconds,
-            candidate.activity.id,
-        ),
-    )
-    if len(ranked) > 1:
-        first_key = (
-            0 if ranked[0].activity.has_heartrate else 1,
-            -ranked[0].overlap_seconds,
-            ranked[0].start_delta_seconds,
-        )
-        second_key = (
-            0 if ranked[1].activity.has_heartrate else 1,
-            -ranked[1].overlap_seconds,
-            ranked[1].start_delta_seconds,
-        )
-        if first_key == second_key:
-            return None
-    return ranked[0]
+    return TimeMatchPolicy(PlanningOptions()).choose(candidates)
 
 
 def _overlapping_workout_ids(workouts: list[LiftosaurWorkout]) -> set[str]:
-    overlapping: set[str] = set()
-    for index, left in enumerate(workouts):
-        for right in workouts[index + 1 :]:
-            if _overlap_seconds(left.start, left.duration_seconds, right.start, right.duration_seconds) > 0:
-                overlapping.add(left.id)
-                overlapping.add(right.id)
-    return overlapping
+    return TimeMatchPolicy(PlanningOptions()).overlapping_workout_ids(workouts)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1089,14 +1129,7 @@ def fetch_hr_streams_for_strava(
     intervals_adapter: IntervalsAdapter,
 ) -> dict[str, StravaHRStream]:
     streams: dict[str, StravaHRStream] = {}
-    candidate_ids = {
-        candidate.activity.id
-        for workout in workouts
-        for activity in intervals_activities
-        if activity.has_heartrate
-        for candidate in [_time_match_candidate(workout, activity, PlanningOptions())]
-        if candidate is not None
-    }
+    candidate_ids = TimeMatchPolicy(PlanningOptions()).intervals_hr_source_ids(workouts, intervals_activities)
     for activity_id in candidate_ids:
         stream = intervals_adapter.fetch_hr_stream(activity_id)
         if stream is not None and stream.time and stream.heartrate:
