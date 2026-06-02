@@ -942,7 +942,7 @@ class HttpIntervalsAdapter(IntervalsAdapter):
             headers={"Authorization": self.auth},
         )
         items = parse_response(payload, list[IntervalsActivityResponse], "Intervals activities")
-        self.activities = [self._activity_from_item(item) for item in items if item.strava_id is None]
+        self.activities = [self._activity_from_item(item) for item in items if item.source != "STRAVA"]
         return self.activities
 
     def update_activity(self, activity_id: str, update: dict[str, object]) -> None:

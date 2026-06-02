@@ -1,7 +1,9 @@
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
 from liftosaur_sync import (
+    HttpIntervalsAdapter,
     InMemoryIntervalsAdapter,
     IntervalsActivity,
     LiftosaurWorkout,
@@ -19,6 +21,32 @@ def instant(value: str) -> datetime:
 
 
 class MutationPayloadTests(unittest.TestCase):
+    def test_http_intervals_adapter_keeps_strava_linked_activities(self):
+        payload = [
+            {
+                "id": "i-linked",
+                "start_date": "2026-05-30T22:47:33Z",
+                "type": "WeightTraining",
+                "elapsed_time": 2734,
+                "name": "Evening Weight Training",
+                "strava_id": "18760231398",
+                "source": "POLAR",
+                "has_heartrate": True,
+            },
+            {
+                "id": "18749281227",
+                "start_date_local": "2026-05-19T19:00:24",
+                "source": "STRAVA",
+            },
+        ]
+        adapter = HttpIntervalsAdapter("api-key", "i123", "America/New_York")
+
+        with patch("liftosaur_sync.core._http_json", return_value=payload):
+            activities = adapter.list_activities(instant("2026-05-19T00:00:00Z").date(), instant("2026-06-02T00:00:00Z").date())
+
+        self.assertEqual([activity.id for activity in activities], ["i-linked"])
+        self.assertEqual(activities[0].type, "WeightTraining")
+
     def test_builds_minimal_enrich_update(self):
         workout = LiftosaurWorkout(
             id="123",
