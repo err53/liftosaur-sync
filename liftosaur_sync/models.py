@@ -17,6 +17,8 @@ STRAVA_EXERCISE_TYPES = {
     "Overhead Press": "OVERHEAD_BARBELL_PRESS",
     "Squat": "BARBELL_BACK_SQUAT",
 }
+# Keep this catalog in sync with Strava's JSON strength upload docs:
+# https://developers.strava.com/docs/uploads/#json-strength-training-limited
 STRAVA_SUPPORTED_EXERCISE_TYPES_BY_CATEGORY = {
     "Bench Press": frozenset(
         {
