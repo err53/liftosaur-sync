@@ -35,6 +35,7 @@ from liftosaur_sync.http import http_multipart_json as _http_multipart_json
 from liftosaur_sync.models import (
     ELIGIBLE_STRAVA_TYPES,
     LB_TO_KG,
+    STRAVA_SUPPORTED_EXERCISE_TYPES,
     STRAVA_EXERCISE_TYPES,
     IntervalsActivity,
     IntervalsTimeMatchIndex,
@@ -283,6 +284,8 @@ def _strava_sets_for_workout(workout: LiftosaurWorkout) -> list[dict[str, object
         exercise_type = STRAVA_EXERCISE_TYPES.get(exercise.name)
         if not exercise_type:
             continue
+        if exercise_type not in STRAVA_SUPPORTED_EXERCISE_TYPES:
+            raise ValueError(f"unsupported Strava exercise type mapping for {exercise.name}: {exercise_type}")
         for set_ in exercise.work_sets:
             if set_.repetitions <= 0:
                 continue

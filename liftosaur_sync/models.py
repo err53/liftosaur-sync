@@ -11,12 +11,98 @@ MANAGED_START_TEMPLATE = "LIFTOSAUR-SYNC-START id={id}"
 MANAGED_END_TEMPLATE = "LIFTOSAUR-SYNC-END id={id}"
 STRAVA_EXERCISE_TYPES = {
     "Bench Press": "BARBELL_BENCH_PRESS",
-    "Bent Over Row": "BARBELL_BENT_OVER_ROW",
+    "Bent Over Row": "BENT_OVER_BARBELL_ROW",
     "Deadlift": "BARBELL_DEADLIFT",
     "Lat Pulldown": "LAT_PULLDOWN",
     "Overhead Press": "OVERHEAD_BARBELL_PRESS",
     "Squat": "BARBELL_BACK_SQUAT",
 }
+STRAVA_SUPPORTED_EXERCISE_TYPES_BY_CATEGORY = {
+    "Bench Press": frozenset(
+        {
+            "BENCH_PRESS_GENERIC",
+            "BARBELL_BENCH_PRESS",
+            "DUMBBELL_BENCH_PRESS",
+            "INCLINE_DUMBBELL_BENCH_PRESS",
+            "INCLINE_BARBELL_BENCH_PRESS",
+            "CLOSE_GRIP_BARBELL_BENCH_PRESS",
+            "WIDE_GRIP_BARBELL_BENCH_PRESS",
+        }
+    ),
+    "Deadlift": frozenset(
+        {
+            "DEADLIFT_GENERIC",
+            "BARBELL_DEADLIFT",
+            "DUMBBELL_DEADLIFT",
+            "BARBELL_STRAIGHT_LEG_DEADLIFT",
+            "SUMO_DEADLIFT",
+            "RACK_PULL",
+            "TRAP_BAR_DEADLIFT",
+            "BARBELL_ROMANIAN_DEADLIFT",
+        }
+    ),
+    "Pull Up": frozenset(
+        {
+            "PULL_UP_GENERIC",
+            "LAT_PULLDOWN",
+            "CLOSE_GRIP_CHIN_UP",
+            "STRAIGHT_ARM_PULLDOWN",
+            "ASSISTED_CHIN_UP",
+            "WEIGHTED_CHIN_UP",
+            "NEGATIVE_PULL_UP",
+            "RING_PULL_UP",
+        }
+    ),
+    "Row": frozenset(
+        {
+            "ROW_GENERIC",
+            "SEATED_CABLE_ROW",
+            "DUMBBELL_ROW",
+            "FACE_PULL",
+            "RENEGADE_ROW",
+            "REVERSE_GRIP_BARBELL_ROW",
+            "T_BAR_ROW",
+            "KETTLEBELL_ROW",
+            "BENT_OVER_ROW",
+            "BENT_OVER_BARBELL_ROW",
+            "BENT_OVER_DUMBBELL_ROW",
+            "MACHINE_ISOLATERAL_HIGH_ROW",
+            "LANDMINE_ROW",
+            "SUSPENSION_LOW_ROW",
+            "MACHINE_SEATED_ROW",
+            "CHEST_SUPPORTED_ROW",
+        }
+    ),
+    "Shoulder Press": frozenset(
+        {
+            "SHOULDER_PRESS_GENERIC",
+            "OVERHEAD_BARBELL_PRESS",
+            "BARBELL_PUSH_PRESS",
+            "ARNOLD_PRESS",
+            "OVERHEAD_DUMBBELL_PRESS",
+            "STANDING_BARBELL_PRESS",
+            "SEATED_BARBELL_PRESS",
+        }
+    ),
+    "Squat": frozenset(
+        {
+            "SQUAT_GENERIC",
+            "BARBELL_BACK_SQUAT",
+            "GOBLET_SQUAT",
+            "LEG_PRESS",
+            "BARBELL_FRONT_SQUAT",
+            "BARBELL_SQUAT_SNATCH",
+            "BARBELL_STEP_UP",
+            "OVERHEAD_SQUAT",
+            "BARBELL_SQUAT",
+        }
+    ),
+}
+STRAVA_SUPPORTED_EXERCISE_TYPES = frozenset(
+    exercise_type
+    for exercise_types in STRAVA_SUPPORTED_EXERCISE_TYPES_BY_CATEGORY.values()
+    for exercise_type in exercise_types
+)
 
 
 @dataclass(frozen=True)

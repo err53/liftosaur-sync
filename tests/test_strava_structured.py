@@ -3,6 +3,8 @@ from datetime import datetime
 
 from liftosaur_sync import (
     IntervalsActivity,
+    STRAVA_EXERCISE_TYPES,
+    STRAVA_SUPPORTED_EXERCISE_TYPES,
     StravaActivity,
     StravaHRStream,
     build_strava_upload_payload,
@@ -38,8 +40,17 @@ class StravaStructuredUploadTests(unittest.TestCase):
         self.assertEqual(payload["streams"], {"time": [600, 660], "heartrate": [90, 100]})
         self.assertEqual(len(payload["sets"]), 16)
         self.assertEqual(payload["sets"][0], {"exercise_type": "OVERHEAD_BARBELL_PRESS", "repetitions": 3, "weight": 31.751})
-        self.assertEqual(payload["sets"][-1], {"exercise_type": "BARBELL_BENT_OVER_ROW", "repetitions": 16, "weight": 24.948})
+        self.assertEqual(payload["sets"][-1], {"exercise_type": "BENT_OVER_BARBELL_ROW", "repetitions": 16, "weight": 24.948})
         self.assertFalse(any("unmapped" in warning for warning in warnings))
+
+    def test_all_mapped_strava_exercises_are_supported(self):
+        unsupported = {
+            exercise_name: exercise_type
+            for exercise_name, exercise_type in STRAVA_EXERCISE_TYPES.items()
+            if exercise_type not in STRAVA_SUPPORTED_EXERCISE_TYPES
+        }
+
+        self.assertEqual(unsupported, {})
 
     def test_strava_plan_skips_existing_external_id_before_time_match(self):
         workout = parse_liftosaur_workout(
