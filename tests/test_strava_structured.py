@@ -37,7 +37,7 @@ class StravaStructuredUploadTests(unittest.TestCase):
         self.assertEqual(payload["elapsed_time"], 3170)
         self.assertEqual(payload["name"], "GZCLP - Day 2")
         self.assertEqual(payload["external_id"], "liftosaur:1780180669253")
-        self.assertEqual(payload["streams"], {"time": [600, 660], "heartrate": [90, 100]})
+        self.assertEqual(payload["streams"], {"time": [0, 60], "heartrate": [90, 100]})
         self.assertEqual(len(payload["sets"]), 16)
         self.assertEqual(payload["sets"][0], {"exercise_type": "OVERHEAD_BARBELL_PRESS", "repetitions": 3, "weight": 31.751})
         self.assertEqual(payload["sets"][-1], {"exercise_type": "BENT_OVER_BARBELL_ROW", "repetitions": 16, "weight": 24.948})
@@ -51,6 +51,21 @@ class StravaStructuredUploadTests(unittest.TestCase):
         }
 
         self.assertEqual(unsupported, {})
+
+    def test_hr_stream_alignment_preserves_source_elapsed_seconds(self):
+        workout = parse_liftosaur_workout(
+            123,
+            """2026-06-04 22:17:03 +00:00 / duration: 1636s / exercises: {
+  Squat / 1x5 100lb
+}""",
+        )
+        intervals = IntervalsActivity("i-hr", "WeightTraining", instant("2026-06-04T22:29:02Z"), 1632, True, None, None)
+        hr = StravaHRStream([0, 1, 1632], [141, 140, 136])
+
+        payload, warnings = build_strava_upload_payload(workout, intervals, hr, "America/Toronto")
+
+        self.assertEqual(payload["streams"], {"time": [0, 1, 1632], "heartrate": [141, 140, 136]})
+        self.assertEqual(warnings, [])
 
     def test_strava_plan_skips_existing_external_id_before_time_match(self):
         workout = parse_liftosaur_workout(

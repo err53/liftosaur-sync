@@ -309,18 +309,17 @@ def _weight_kg(weight: float | None, unit: str | None) -> float | None:
 
 def _align_hr_stream(
     workout: LiftosaurWorkout,
-    intervals_activity: IntervalsActivity,
+    _intervals_activity: IntervalsActivity,
     hr_stream: StravaHRStream,
 ) -> tuple[dict[str, list[int]], list[str]]:
     if workout.duration_seconds is None:
         raise ValueError("missing duration")
-    offset = int(round((intervals_activity.start - workout.start).total_seconds()))
     times: list[int] = []
     heartrates: list[int] = []
     for source_time, hr in zip(hr_stream.time, hr_stream.heartrate):
         if hr is None:
             continue
-        aligned_time = offset + int(source_time)
+        aligned_time = int(source_time)
         if 0 <= aligned_time <= workout.duration_seconds:
             times.append(aligned_time)
             heartrates.append(int(hr))

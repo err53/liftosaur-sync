@@ -33,7 +33,7 @@ Liftosaur Sync will create structured Strava Activities for strength training by
 - Strava idempotency treats `liftosaur:<liftosaur_history_id>` and `liftosaur:<liftosaur_history_id>.json` as the same Liftosaur-derived external ID.
 - Strava external ID matches take precedence over Strava Time Matches when deciding whether a Liftosaur Workout was already uploaded.
 - Structured Strava Upload activity start and duration come from the Liftosaur Workout; the Time Matched Intervals Activity supplies HR samples only.
-- Intervals HR stream timestamps are translated onto the Liftosaur Workout timeline and clipped to the Liftosaur Workout duration before upload.
+- Intervals HR stream timestamps are treated as elapsed seconds from the start of the Time Matched Intervals Activity, then normalized onto the Structured Strava Upload timeline without applying wall-clock start offset. The stream is clipped to the Liftosaur Workout duration before upload.
 - Structured Strava Uploads require at least one clipped HR sample; partial HR coverage is allowed, with a warning when coverage is less than 50% of the Liftosaur Workout duration.
 - `all --apply` applies Intervals writes before Strava uploads, but Strava eligibility is planned from pre-apply fetched Intervals HR content and does not depend on Intervals write outcomes from the same run.
 - The `strava` verb reads Intervals HR content but does not mutate Intervals; Intervals mutations remain under the `intervals` verb or the composed `all` verb.
