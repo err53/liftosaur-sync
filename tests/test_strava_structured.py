@@ -22,6 +22,7 @@ class StravaStructuredUploadTests(unittest.TestCase):
             """2026-05-30 22:37:49 +00:00 / program: "GZCLP" / dayName: "Day 2" / week: 1 / dayInWeek: 2 / duration: 3170s / exercises: {
   Overhead Press / 4x3 70lb, 1x6 70lb / warmup: 1x5 55lb / target: 4x3 70lb, 1x3+ 70lb
   Deadlift / 8x1 220lb, 2x0 220lb / warmup: 1x5 65lb / target: 9x1 220lb, 1x1+ 220lb
+  Bent Over Row / 2x15 55lb, 1x16 55lb / target: 2x15 55lb, 1x15+ 55lb
 }""",
         )
         intervals = IntervalsActivity("i-hr", "WeightTraining", instant("2026-05-30T22:47:49Z"), 1800, True, None, None)
@@ -35,9 +36,9 @@ class StravaStructuredUploadTests(unittest.TestCase):
         self.assertEqual(payload["name"], "GZCLP - Day 2")
         self.assertEqual(payload["external_id"], "liftosaur:1780180669253")
         self.assertEqual(payload["streams"], {"time": [600, 660], "heartrate": [90, 100]})
-        self.assertEqual(len(payload["sets"]), 13)
+        self.assertEqual(len(payload["sets"]), 16)
         self.assertEqual(payload["sets"][0], {"exercise_type": "OVERHEAD_BARBELL_PRESS", "repetitions": 3, "weight": 31.751})
-        self.assertEqual(payload["sets"][-1], {"exercise_type": "BARBELL_DEADLIFT", "repetitions": 1, "weight": 99.79})
+        self.assertEqual(payload["sets"][-1], {"exercise_type": "BARBELL_BENT_OVER_ROW", "repetitions": 16, "weight": 24.948})
         self.assertFalse(any("unmapped" in warning for warning in warnings))
 
     def test_strava_plan_skips_existing_external_id_before_time_match(self):
