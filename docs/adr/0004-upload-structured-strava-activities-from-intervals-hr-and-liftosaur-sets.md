@@ -13,13 +13,13 @@ Liftosaur Sync will create structured Strava Activities for strength training by
 - Strava can receive individual sets, repetitions, and weights instead of only description text.
 - Intervals remains part of the workflow as the low-effort source for HR-bearing activity data.
 - HealthFit-to-Strava sync should be disabled for these strength workouts to avoid duplicate Strava Activities.
-- If an existing Strava Activity Time Matches a Liftosaur Workout, Structured Strava Upload is skipped by default rather than creating a duplicate.
+- If an existing Strava Activity Time Matches a Liftosaur Workout, Structured Strava Upload is skipped by default rather than creating a duplicate, but Strava title and description metadata may be updated.
 - Existing Strava Activity checks use the same core Time Match rules as Intervals while filtering to plausible strength-related Strava sport types.
 - The sync must verify that a Time Matched Intervals Activity exposes enough HR stream data before uploading a structured Strava Activity.
 - If Intervals HR streams are unavailable for a matched activity, the sync should skip and warn by default rather than uploading a no-HR Strava Activity.
 - Liftosaur exercise names must be mapped to Strava `exercise_type` identifiers through an explicit mapping table; a Structured Strava Upload is skipped unless every exercise with work sets has a mapping.
 - Structured Strava Uploads are invoked through an explicit Strava CLI verb rather than a default target, reducing accidental uploads.
-- The Strava CLI verb performs Structured Strava Uploads only; it does not enrich existing Strava Activity descriptions.
+- The Strava CLI verb performs Structured Strava Uploads for unmatched Liftosaur Workouts and metadata enrichment for existing Strava Time Matches.
 - `--apply` is sufficient authorization to upload eligible Structured Strava Uploads once the explicit Strava CLI verb is selected.
 - An `all` CLI verb may run both Intervals sync and Strava structured upload planning/apply logic when their gates pass.
 - The `all` verb's Strava planning uses only pre-existing Intervals Activities with actual HR stream/content availability; Manual Fallback Activities created during the same run and tag-based checks do not satisfy the HR source gate.

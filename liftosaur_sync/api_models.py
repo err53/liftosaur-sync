@@ -68,6 +68,7 @@ class StravaUploadResponse(msgspec.Struct):
 class StravaUploadStatusResponse(msgspec.Struct):
     activity_id: int | str | None = None
     error: str | None = None
+    status: str | None = None
 
 
 class StravaTokenResponse(msgspec.Struct):

@@ -53,7 +53,7 @@ uv run liftosaur-sync all --days 14 --apply
 
 `intervals --apply` enriches Time Matched Intervals Activities with a plain-text managed Liftosaur description block, `kg_lifted` when computed, and the `liftosaur` tag. On later runs, the managed block's Liftosaur history ID is used before Time Match so the same Intervals Activity is updated again. It creates or updates Manual Fallback Activities only when no eligible Time Match exists.
 
-`strava --apply` uploads structured Strava Activities using Liftosaur work sets and HR streams from pre-existing Time Matched Intervals Activities. Existing Strava Time Matches block upload to avoid duplicates. Disable HealthFit-to-Strava strength sync before using this mode.
+`strava --apply` uploads structured Strava Activities using Liftosaur work sets and HR streams from pre-existing Time Matched Intervals Activities. Existing Strava Time Matches block upload to avoid duplicates, but their Strava title and description are updated from the matching Liftosaur Workout. Disable HealthFit-to-Strava strength sync before using structured uploads.
 
 `all --apply` runs Intervals writes first, then Strava uploads using HR content fetched before Intervals writes.
 

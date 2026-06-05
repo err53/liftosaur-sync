@@ -189,6 +189,7 @@ class StravaSyncAction:
     mapped_set_count: int = 0
     warnings: tuple[str, ...] = ()
     upload: StructuredStravaUpload | None = None
+    metadata_update: dict[str, object] | None = None
 
     @classmethod
     def upload_activity(cls, upload: StructuredStravaUpload) -> "StravaSyncAction":
@@ -199,6 +200,24 @@ class StravaSyncAction:
             mapped_set_count=upload.mapped_set_count,
             warnings=upload.warnings,
             upload=upload,
+        )
+
+    @classmethod
+    def update_metadata(
+        cls,
+        liftosaur_id: str,
+        strava_id: str,
+        metadata_update: dict[str, object],
+        intervals_id: str | None = None,
+        reason: str | None = None,
+    ) -> "StravaSyncAction":
+        return cls(
+            "metadata",
+            liftosaur_id,
+            intervals_id=intervals_id,
+            strava_id=strava_id,
+            reason=reason,
+            metadata_update=metadata_update,
         )
 
     @classmethod
@@ -215,6 +234,10 @@ class StravaSyncAction:
     @property
     def is_upload(self) -> bool:
         return self.kind == "upload"
+
+    @property
+    def is_metadata(self) -> bool:
+        return self.kind == "metadata"
 
     @property
     def is_skip(self) -> bool:

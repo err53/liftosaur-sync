@@ -1,12 +1,15 @@
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
 from liftosaur_sync import (
+    HttpStravaAdapter,
     IntervalsActivity,
     STRAVA_EXERCISE_TYPES,
     STRAVA_SUPPORTED_EXERCISE_TYPES,
     StravaActivity,
     StravaHRStream,
+    apply_strava_sync_plan,
     build_strava_upload_payload,
     parse_liftosaur_workout,
     plan_strava_sync,
@@ -39,8 +42,8 @@ class StravaStructuredUploadTests(unittest.TestCase):
         self.assertEqual(payload["external_id"], "liftosaur:1780180669253")
         self.assertEqual(payload["streams"], {"time": [0, 60], "heartrate": [90, 100]})
         self.assertEqual(len(payload["sets"]), 16)
-        self.assertEqual(payload["sets"][0], {"exercise_type": "OVERHEAD_BARBELL_PRESS", "repetitions": 3, "weight": 31.751})
-        self.assertEqual(payload["sets"][-1], {"exercise_type": "BENT_OVER_BARBELL_ROW", "repetitions": 16, "weight": 24.948})
+        self.assertEqual(payload["sets"][0], {"exercise_type": "OVERHEAD_BARBELL_PRESS", "repetitions": 3, "weight": 70})
+        self.assertEqual(payload["sets"][-1], {"exercise_type": "BENT_OVER_BARBELL_ROW", "repetitions": 16, "weight": 55})
         self.assertFalse(any("unmapped" in warning for warning in warnings))
 
     def test_all_mapped_strava_exercises_are_supported(self):
@@ -67,7 +70,21 @@ class StravaStructuredUploadTests(unittest.TestCase):
         self.assertEqual(payload["streams"], {"time": [0, 1, 1632], "heartrate": [141, 140, 136]})
         self.assertEqual(warnings, [])
 
-    def test_strava_plan_skips_existing_external_id_before_time_match(self):
+    def test_strava_set_weights_preserve_liftosaur_units(self):
+        workout = parse_liftosaur_workout(
+            123,
+            """2026-06-04 22:17:03 +00:00 / duration: 120s / exercises: {
+  Squat / 1x5 100kg
+}""",
+        )
+        intervals = IntervalsActivity("i-hr", "WeightTraining", instant("2026-06-04T22:17:03Z"), 120, True, None, None)
+        hr = StravaHRStream([0], [100])
+
+        payload, _warnings = build_strava_upload_payload(workout, intervals, hr, "America/Toronto")
+
+        self.assertEqual(payload["sets"][0]["weight"], 100)
+
+    def test_strava_plan_updates_metadata_for_existing_external_id_before_time_match(self):
         workout = parse_liftosaur_workout(
             123,
             """2026-05-30 22:37:49 +00:00 / program: "GZCLP" / dayName: "Day 2" / duration: 3170s / exercises: {
@@ -79,11 +96,13 @@ class StravaStructuredUploadTests(unittest.TestCase):
 
         plan = plan_strava_sync([workout], [intervals], [existing], {"i-hr": StravaHRStream([0], [90])}, "America/Toronto")
 
-        self.assertEqual(plan.actions[0].kind, "skip")
+        self.assertEqual(plan.actions[0].kind, "metadata")
         self.assertEqual(plan.actions[0].reason, "already uploaded")
         self.assertEqual(plan.actions[0].strava_id, "s1")
+        self.assertEqual(plan.actions[0].metadata_update["name"], "GZCLP - Day 2")
+        self.assertIn("Liftosaur history ID: 123", plan.actions[0].metadata_update["description"])
 
-    def test_strava_plan_skips_existing_time_match(self):
+    def test_strava_plan_updates_metadata_for_existing_time_match(self):
         workout = parse_liftosaur_workout(
             123,
             """2026-05-30 22:37:49 +00:00 / program: "GZCLP" / dayName: "Day 2" / duration: 3170s / exercises: {
@@ -95,9 +114,38 @@ class StravaStructuredUploadTests(unittest.TestCase):
 
         plan = plan_strava_sync([workout], [intervals], [existing], {"i-hr": StravaHRStream([0], [90])}, "America/Toronto")
 
-        self.assertEqual(plan.actions[0].kind, "skip")
+        self.assertEqual(plan.actions[0].kind, "metadata")
         self.assertEqual(plan.actions[0].reason, "existing Strava Time Match")
         self.assertEqual(plan.actions[0].strava_id, "s1")
+        self.assertEqual(plan.actions[0].metadata_update["name"], "GZCLP - Day 2")
+
+    def test_apply_strava_plan_updates_existing_metadata(self):
+        workout = parse_liftosaur_workout(
+            123,
+            """2026-05-30 22:37:49 +00:00 / program: "GZCLP" / dayName: "Day 2" / duration: 3170s / exercises: {
+  Deadlift / 1x1 220lb
+}""",
+        )
+        intervals = IntervalsActivity("i-hr", "WeightTraining", instant("2026-05-30T22:37:49Z"), 3170, True, None, None)
+        existing = StravaActivity("s1", "Strength", "WeightTraining", instant("2026-05-30T22:40:00Z"), 3000, True, "healthfit.fit")
+        plan = plan_strava_sync([workout], [intervals], [existing], {"i-hr": StravaHRStream([0], [90])}, "America/Toronto")
+
+        class FakeStravaAdapter:
+            def __init__(self):
+                self.metadata_updates = []
+
+            def update_activity_metadata(self, activity_id, update):
+                self.metadata_updates.append((activity_id, update))
+
+            def upload_structured_activity(self, payload):
+                raise AssertionError("metadata action should not upload")
+
+        adapter = FakeStravaAdapter()
+
+        outcomes = apply_strava_sync_plan(plan, adapter)
+
+        self.assertEqual(outcomes[0].status, "metadata_enriched")
+        self.assertEqual(adapter.metadata_updates, [("s1", plan.actions[0].metadata_update)])
 
     def test_strava_plan_requires_full_mapping_and_hr_stream(self):
         unmapped = parse_liftosaur_workout(
@@ -122,6 +170,16 @@ class StravaStructuredUploadTests(unittest.TestCase):
         self.assertEqual([action.kind for action in plan.actions], ["skip", "skip"])
         self.assertEqual(plan.actions[0].reason, "unmapped exercises")
         self.assertEqual(plan.actions[1].reason, "missing HR stream")
+
+    def test_strava_upload_poll_reports_terminal_status_without_error(self):
+        adapter = HttpStravaAdapter("token", "America/Toronto")
+
+        with patch("liftosaur_sync.core.time.sleep"), patch(
+            "liftosaur_sync.core._http_json",
+            return_value={"error": None, "status": "The created activity has been deleted.", "activity_id": None},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "The created activity has been deleted"):
+                adapter._poll_upload("19900579401")
 
 
 if __name__ == "__main__":

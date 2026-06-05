@@ -47,7 +47,7 @@ class LiftosaurProvenance:
         lines.append(workout.text)
         return "\n".join(lines)
 
-    def render_strava_description(self, workout: LiftosaurWorkout, intervals_activity: object) -> str:
+    def render_strava_description(self, workout: LiftosaurWorkout, intervals_activity: object | None) -> str:
         lines = ["Synced from Liftosaur."]
         if workout.program:
             lines.append(f"Program: {workout.program}")
@@ -56,7 +56,8 @@ class LiftosaurProvenance:
         lines.append(f"Liftosaur history ID: {workout.id}")
         if workout.kg_lifted is not None:
             lines.append(f"kg_lifted: {workout.kg_lifted:.3f}")
-        lines.append(f"HR source: Intervals Activity {getattr(intervals_activity, 'id')}")
+        if intervals_activity is not None:
+            lines.append(f"HR source: Intervals Activity {getattr(intervals_activity, 'id')}")
         return "\n".join(lines)
 
     def managed_block_patterns(self, liftosaur_id: str) -> list[re.Pattern[str]]:

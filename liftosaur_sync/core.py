@@ -170,21 +170,38 @@ def plan_strava_sync(
     warnings: list[str] = []
     actions: list[StravaSyncAction] = []
     for workout in workouts:
+        intervals_match = time_matches.choose_intervals_hr_source(workout, intervals_activities)
+        intervals_activity = intervals_match.activity if intervals_match is not None else None
         external_matches = [activity for activity in strava_activities if PROVENANCE.matches_external_id(activity.external_id, workout)]
         if external_matches:
             if len(external_matches) > 1:
                 warnings.append(f"Liftosaur Workout {workout.id} has multiple Strava external ID matches")
-            actions.append(StravaSyncAction.skip(workout.id, "already uploaded", strava_id=external_matches[0].id))
+            actions.append(
+                StravaSyncAction.update_metadata(
+                    workout.id,
+                    external_matches[0].id,
+                    _strava_metadata_update(workout, intervals_activity),
+                    intervals_id=intervals_activity.id if intervals_activity is not None else None,
+                    reason="already uploaded",
+                )
+            )
             continue
 
         strava_time_matches = time_matches.strava_time_matches(workout, strava_activities)
         if strava_time_matches:
             if len(strava_time_matches) > 1:
                 warnings.append(f"Liftosaur Workout {workout.id} has multiple existing Strava Time Matches")
-            actions.append(StravaSyncAction.skip(workout.id, "existing Strava Time Match", strava_id=strava_time_matches[0].id))
+            actions.append(
+                StravaSyncAction.update_metadata(
+                    workout.id,
+                    strava_time_matches[0].id,
+                    _strava_metadata_update(workout, intervals_activity),
+                    intervals_id=intervals_activity.id if intervals_activity is not None else None,
+                    reason="existing Strava Time Match",
+                )
+            )
             continue
 
-        intervals_match = time_matches.choose_intervals_hr_source(workout, intervals_activities)
         if intervals_match is None:
             actions.append(StravaSyncAction.skip(workout.id, "missing Intervals Time Match"))
             continue
@@ -228,6 +245,16 @@ def build_strava_upload_payload(
 ) -> tuple[dict[str, object], list[str]]:
     upload = StructuredStravaUploadPolicy(timezone_name).build(workout, intervals_activity, hr_stream)
     return upload.payload, list(upload.warnings)
+
+
+def _strava_metadata_update(
+    workout: LiftosaurWorkout,
+    intervals_activity: IntervalsActivity | None,
+) -> dict[str, object]:
+    return {
+        "name": _strava_upload_name(workout),
+        "description": PROVENANCE.render_strava_description(workout, intervals_activity),
+    }
 
 
 class StructuredStravaUploadPolicy:
@@ -290,19 +317,17 @@ def _strava_sets_for_workout(workout: LiftosaurWorkout) -> list[dict[str, object
             if set_.repetitions <= 0:
                 continue
             item: dict[str, object] = {"exercise_type": exercise_type, "repetitions": set_.repetitions}
-            weight = _weight_kg(set_.weight, set_.unit)
+            weight = _native_weight(set_.weight, set_.unit)
             if weight is not None:
                 item["weight"] = round(weight, 3)
             sets.append(item)
     return sets
 
 
-def _weight_kg(weight: float | None, unit: str | None) -> float | None:
+def _native_weight(weight: float | None, unit: str | None) -> float | None:
     if weight is None:
         return None
-    if unit == "lb":
-        return weight * LB_TO_KG
-    if unit == "kg":
+    if unit in {"lb", "kg"}:
         return weight
     return None
 
@@ -875,6 +900,11 @@ def apply_strava_sync_plan(
                     raise RuntimeError("missing Structured Strava Upload intent")
                 strava_id = strava_adapter.upload_structured_activity(action.upload.payload)
                 outcomes.append(StravaWriteOutcome(action.liftosaur_id, "uploaded", strava_id=strava_id))
+            elif action.is_metadata:
+                if action.strava_id is None or action.metadata_update is None:
+                    raise RuntimeError("missing Strava metadata update intent")
+                strava_adapter.update_activity_metadata(action.strava_id, action.metadata_update)
+                outcomes.append(StravaWriteOutcome(action.liftosaur_id, "metadata_enriched", strava_id=action.strava_id, reason=action.reason))
             elif action.is_skip:
                 outcomes.append(StravaWriteOutcome(action.liftosaur_id, "skipped", strava_id=action.strava_id, reason=action.reason))
         except Exception as error:
@@ -882,7 +912,7 @@ def apply_strava_sync_plan(
                 StravaWriteOutcome(
                     action.liftosaur_id,
                     "failed",
-                    reason="strava_upload_failed",
+                    reason="strava_write_failed",
                     detail=str(error),
                 )
             )
@@ -1112,8 +1142,17 @@ class HttpStravaAdapter:
         upload_response = parse_response(upload, StravaUploadResponse, "Strava upload")
         return self._poll_upload(str(upload_response.id))
 
+    def update_activity_metadata(self, activity_id: str, update: dict[str, object]) -> None:
+        _http_json(
+            "PUT",
+            f"https://www.strava.com/api/v3/activities/{urllib.parse.quote(activity_id)}",
+            headers={"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"},
+            body=update,
+        )
+
     def _poll_upload(self, upload_id: str) -> str:
-        for _ in range(30):
+        last_status: str | None = None
+        for _ in range(90):
             time.sleep(1)
             payload = _http_json(
                 "GET",
@@ -1121,11 +1160,15 @@ class HttpStravaAdapter:
                 headers={"Authorization": f"Bearer {self.access_token}"},
             )
             upload = parse_response(payload, StravaUploadStatusResponse, "Strava upload status")
+            last_status = upload.status or last_status
             if upload.error:
                 raise RuntimeError(upload.error)
             if upload.activity_id:
                 return str(upload.activity_id)
-        raise RuntimeError(f"Strava upload {upload_id} did not finish processing")
+            if upload.status and upload.status != "Your activity is still being processed.":
+                raise RuntimeError(upload.status)
+        detail = f" Last status: {last_status}" if last_status else ""
+        raise RuntimeError(f"Strava upload {upload_id} did not finish processing.{detail}")
 
 
 def build_enrich_update(workout: LiftosaurWorkout, activity: IntervalsActivity) -> dict[str, object]:
@@ -1310,6 +1353,19 @@ def print_strava_plan(
                     outcome.status if outcome else "",
                     outcome.strava_id if outcome and outcome.strava_id else "",
                     _strava_outcome_note(outcome),
+                ]
+            )
+        elif action.is_metadata:
+            rows.append(
+                [
+                    "metadata",
+                    action.liftosaur_id,
+                    action.intervals_id or "",
+                    action.strava_id or "",
+                    "",
+                    outcome.status if outcome else "",
+                    outcome.strava_id if outcome and outcome.strava_id else "",
+                    action.reason or _strava_outcome_note(outcome),
                 ]
             )
         else:
