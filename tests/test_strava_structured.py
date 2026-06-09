@@ -42,8 +42,8 @@ class StravaStructuredUploadTests(unittest.TestCase):
         self.assertEqual(payload["external_id"], "liftosaur:1780180669253")
         self.assertEqual(payload["streams"], {"time": [0, 60], "heartrate": [90, 100]})
         self.assertEqual(len(payload["sets"]), 16)
-        self.assertEqual(payload["sets"][0], {"exercise_type": "OVERHEAD_BARBELL_PRESS", "repetitions": 3, "weight": 70})
-        self.assertEqual(payload["sets"][-1], {"exercise_type": "BENT_OVER_BARBELL_ROW", "repetitions": 16, "weight": 55})
+        self.assertEqual(payload["sets"][0], {"exercise_type": "OVERHEAD_BARBELL_PRESS", "repetitions": 3, "weight": 31.751})
+        self.assertEqual(payload["sets"][-1], {"exercise_type": "BENT_OVER_BARBELL_ROW", "repetitions": 16, "weight": 24.948})
         self.assertFalse(any("unmapped" in warning for warning in warnings))
 
     def test_all_mapped_strava_exercises_are_supported(self):
@@ -70,7 +70,7 @@ class StravaStructuredUploadTests(unittest.TestCase):
         self.assertEqual(payload["streams"], {"time": [0, 1, 1632], "heartrate": [141, 140, 136]})
         self.assertEqual(warnings, [])
 
-    def test_strava_set_weights_preserve_liftosaur_units(self):
+    def test_strava_set_weights_are_uploaded_in_kilograms(self):
         workout = parse_liftosaur_workout(
             123,
             """2026-06-04 22:17:03 +00:00 / duration: 120s / exercises: {

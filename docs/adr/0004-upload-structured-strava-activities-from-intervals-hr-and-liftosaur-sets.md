@@ -27,6 +27,7 @@ Liftosaur Sync will create structured Strava Activities for strength training by
 - Initial Strava JSON uploads include HR streams only; optional active/moving streams are deferred until their semantics for strength training are clear.
 - Strava set objects omit `start_time` unless Liftosaur exposes actual set timestamps; the sync does not invent set timing from exercise order or workout duration.
 - Structured Strava Uploads include Liftosaur work sets only; warmup and missed sets are excluded initially.
+- Structured Strava Upload set weights are always serialized as kilograms because Strava's JSON strength format has no unit field and defines `weight` as kilograms.
 - Structured Strava Upload names use `<program> - <day name>` when both are available, falling back to the available value or `Strength Training`.
 - Structured Strava Upload descriptions are concise provenance summaries and do not include raw Liftosaur data by default.
 - Structured Strava Uploads use the same stable Liftosaur-derived external ID stem as Intervals Manual Fallback Activities, `liftosaur:<liftosaur_history_id>`; Strava may return the uploaded file extension as part of its stored external ID.

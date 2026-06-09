@@ -317,17 +317,20 @@ def _strava_sets_for_workout(workout: LiftosaurWorkout) -> list[dict[str, object
             if set_.repetitions <= 0:
                 continue
             item: dict[str, object] = {"exercise_type": exercise_type, "repetitions": set_.repetitions}
-            weight = _native_weight(set_.weight, set_.unit)
+            weight = _strava_weight_kg(set_.weight, set_.unit)
             if weight is not None:
                 item["weight"] = round(weight, 3)
             sets.append(item)
     return sets
 
 
-def _native_weight(weight: float | None, unit: str | None) -> float | None:
+def _strava_weight_kg(weight: float | None, unit: str | None) -> float | None:
+    # Strava JSON strength uploads define set weight as kilograms and have no unit field.
     if weight is None:
         return None
-    if unit in {"lb", "kg"}:
+    if unit == "lb":
+        return weight * LB_TO_KG
+    if unit == "kg":
         return weight
     return None
 
